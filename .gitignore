@@ -1,7 +1,7 @@
 .github
 .vscode
 
-.env.dev
+.env*
 .venv
 __pycache__
 
