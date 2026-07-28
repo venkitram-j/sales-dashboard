@@ -3,30 +3,24 @@ Sales Dashboard — reads pre-ingested sales data from Postgres (populated by
 ingest.py) per (product, branch).
 
 Run with:
-    streamlit run dashboard_app.py
+    streamlit run app.py
 """
 
 import os
 import pandas as pd
 import streamlit as st
 
-from db import get_conn, init_schema, get_settings, save_settings
+from database.db import DBConn
 from ingest import normalize_col, denormalize_col, run_ingestion
 
 st.set_page_config(page_title="Sales Dashboard", layout="wide")
 
 # ---------------------------------------------------------------------------
-# DB setup (cached across reruns within a session; cheap to call anyway)
+# DB setup
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def ensure_schema():
-    init_schema()
-    return True
-
-
-ensure_schema()
-run_ingestion()
+db_conn = DBConn()
+db_conn.init_schema()
 
 # ---------------------------------------------------------------------------
 # Settings form (source folder, header row, start column, columns to read)
@@ -34,114 +28,117 @@ run_ingestion()
 # expander further down.
 # ---------------------------------------------------------------------------
 
-def render_settings_form(current, key_prefix):
-    with st.form(f"{key_prefix}_settings_form"):
-        source_folder = st.text_input(
-            "Source folder (path on the server running this app)",
-            value=current["source_folder"],
-            placeholder=r"e.g. /mnt/company_share/sales_files",
-        )
-        c1, c2 = st.columns(2)
-        with c1:
-            start_col = st.text_input("Start column", value=current["start_col"])
-        with c2:
-            header_row = st.number_input("Header row #", min_value=1, value=current["header_row"], step=1)
+# def render_settings_form(current, key_prefix):
+#     with st.form(f"{key_prefix}_settings_form"):
+#         source_folder = st.text_input(
+#             "Source folder (path on the server running this app)",
+#             value=current["source_folder"],
+#             placeholder=r"e.g. /mnt/company_share/sales_files",
+#         )
+#         c1, c2 = st.columns(2)
+#         with c1:
+#             start_col = st.text_input("Start column", value=current["start_col"])
+#         with c2:
+#             header_row = st.number_input("Header row #", min_value=1, value=current["header_row"], step=1)
 
-        if key_prefix == "setup":
-            c3, c4 = st.columns(2)
-            with c3:
-                order_process_days = st.number_input(
-                    "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
+#         if key_prefix == "setup":
+#             c3, c4 = st.columns(2)
+#             with c3:
+#                 order_process_days = st.number_input(
+#                     "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
     
-            with c4:
-                default_lead_days = st.number_input(
-                    "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
+#             with c4:
+#                 default_lead_days = st.number_input(
+#                     "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
             
-            c5, c6 ,c7 = st.columns(3)
-            with c5:
-                order_buffer_high_days = st.number_input(
-                    "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
+#             c5, c6 ,c7 = st.columns(3)
+#             with c5:
+#                 order_buffer_high_days = st.number_input(
+#                     "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
 
-            with c6:
-                order_buffer_medium_days = st.number_input(
-                    "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
+#             with c6:
+#                 order_buffer_medium_days = st.number_input(
+#                     "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
 
-            with c7:
-                order_buffer_low_days = st.number_input(
-                    "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
-        else:
-            order_process_days = st.number_input(
-                "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
+#             with c7:
+#                 order_buffer_low_days = st.number_input(
+#                     "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
+#         else:
+#             order_process_days = st.number_input(
+#                 "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
 
-            default_lead_days = st.number_input(
-                "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
+#             default_lead_days = st.number_input(
+#                 "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
 
-            order_buffer_high_days = st.number_input(
-                "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
+#             order_buffer_high_days = st.number_input(
+#                 "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
 
-            order_buffer_medium_days = st.number_input(
-                "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
+#             order_buffer_medium_days = st.number_input(
+#                 "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
 
-            order_buffer_low_days = st.number_input(
-                "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
+#             order_buffer_low_days = st.number_input(
+#                 "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
 
-        submitted = st.form_submit_button("Save settings")
+#         submitted = st.form_submit_button("Save settings")
 
-    if not submitted:
-        return False
+#     if not submitted:
+#         return False
 
-    folder = source_folder.strip()
-    if not folder:
-        st.error("Source folder is required.")
-        return False
-    if not os.path.isdir(folder):
-        st.error(f"'{folder}' doesn't exist or isn't accessible from this server.")
-        return False
+#     folder = source_folder.strip()
+#     if not folder:
+#         st.error("Source folder is required.")
+#         return False
+#     if not os.path.isdir(folder):
+#         st.error(f"'{folder}' doesn't exist or isn't accessible from this server.")
+#         return False
 
-    data = {
-        "source_folder": source_folder.strip(),
-        "header_row": str(int(header_row)),
-        "start_col": start_col.strip().upper() or "A",
-        "order_process_days": str(int(order_process_days)),
-        "default_lead_days": str(int(default_lead_days)),
-        "order_buffer_high_days": str(int(order_buffer_high_days)),
-        "order_buffer_medium_days": str(int(order_buffer_medium_days)),
-        "order_buffer_low_days": str(int(order_buffer_low_days)),
-    }
-    save_settings(data)
-    get_cached_settings.clear()
-    st.success("Settings saved.")
-    return True
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_cached_settings():
-    return get_settings()
+#     data = {
+#         "source_folder": source_folder.strip(),
+#         "header_row": str(int(header_row)),
+#         "start_col": start_col.strip().upper() or "A",
+#         "order_process_days": str(int(order_process_days)),
+#         "default_lead_days": str(int(default_lead_days)),
+#         "order_buffer_high_days": str(int(order_buffer_high_days)),
+#         "order_buffer_medium_days": str(int(order_buffer_medium_days)),
+#         "order_buffer_low_days": str(int(order_buffer_low_days)),
+#     }
+#     save_settings(data)
+#     get_cached_settings.clear()
+#     st.success("Settings saved.")
+#     return True
 
 
-settings = get_cached_settings()
+# @st.cache_data(ttl=60, show_spinner=False)
+# def get_cached_settings():
+#     return get_settings()
 
-if not settings["source_folder"]:
-    st.title("⚙️ Set up the data source")
-    st.write(
-        "Before the dashboard can load, tell it where to find your Excel files "
-        "and how they're formatted. This is stored in the database, so it only "
-        "needs to be set once (from anywhere on the team)."
-    )
-    if render_settings_form(settings, key_prefix="setup"):
-        st.rerun()
-    st.stop()
+
+# settings = get_cached_settings()
+
+# if not settings["source_folder"]:
+#     st.title("⚙️ Set up the data source")
+#     st.write(
+#         "Before the dashboard can load, tell it where to find your Excel files "
+#         "and how they're formatted. This is stored in the database, so it only "
+#         "needs to be set once (from anywhere on the team)."
+#     )
+#     if render_settings_form(settings, key_prefix="setup"):
+#         st.rerun()
+#     st.stop()
 
 # ---------------------------------------------------------------------------
 # Load and display materialized view and lead-time data
 # ---------------------------------------------------------------------------
+
+with st.spinner("Injesting data from Excel files into database..."):
+    run_ingestion()
 
 st.title("📊 Sales Dashboard")
 
 st.sidebar.header("📁 Dashboard Config")
 
 if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
-    with st.spinner("Refreshing Data — this scans the source folder for new/changed files…"):
+    with st.spinner("Refreshing Data — this scans the source folder for new/changed files..."):
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("REFRESH MATERIALIZED VIEW product_branch_sales")

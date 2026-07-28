@@ -1,6 +1,7 @@
 .github
 .vscode
 
+.streamlit
 .env*
 .venv
 __pycache__
