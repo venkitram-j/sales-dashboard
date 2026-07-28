@@ -1,5 +1,15 @@
 -- Sales dashboard schema. Safe to run repeatedly (IF NOT EXISTS everywhere).
 
+-- Operational ingestion settings (source folder, header row, start column,
+-- columns to read, order_process_time, order_buffer_high, order_buffer_medium,
+-- order_buffer_low) live here instead of .env, so they can be configured
+-- and changed from the dashboard without redeploying. One row per key.
+CREATE TABLE IF NOT EXISTS app_settings (
+    key          TEXT PRIMARY KEY,
+    value        TEXT,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Tracks which source files have been ingested, and when, so daily runs
 -- only process new or changed files. period_start/period_end record what
 -- date range the FILE covers overall (parsed from its file name) — used
@@ -15,9 +25,8 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     error_message   TEXT
 );
 
--- One row per (product, branch[, date]) sales record, tagged with the file
+-- One row per (product, branch) sales record, tagged with the file
 -- it came from so a re-ingested file can cleanly replace its own rows.
--- sale_date is populated when the file has a real per-row date column;
 -- period_start/period_end are denormalized from the file's parsed period
 -- so date-range filtering works even for files with no per-row dates.
 CREATE TABLE IF NOT EXISTS sales_fact (
@@ -37,30 +46,16 @@ CREATE TABLE IF NOT EXISTS sales_fact (
 CREATE INDEX IF NOT EXISTS idx_sales_fact_product     ON sales_fact (product_code);
 CREATE INDEX IF NOT EXISTS idx_sales_fact_description ON sales_fact (description);
 CREATE INDEX IF NOT EXISTS idx_sales_fact_branch      ON sales_fact (branch);
+CREATE INDEX IF NOT EXISTS idx_sales_fact_admin      ON sales_fact (admin);
+CREATE INDEX IF NOT EXISTS idx_sales_fact_buyer      ON sales_fact (buyer);
 CREATE INDEX IF NOT EXISTS idx_sales_fact_source_file ON sales_fact (source_file);
 CREATE INDEX IF NOT EXISTS idx_sales_fact_prod_branch ON sales_fact (product_code, branch);
 
--- Configuration table for reorder parameters
-CREATE TABLE IF NOT EXISTS reorder_config (
-    config_key   TEXT PRIMARY KEY,
-    config_value INTEGER NOT NULL,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- Insert default values if not exists
-INSERT INTO reorder_config (config_key, config_value)
-VALUES
-    ('ORDER_PROCESS_TIME', 4),
-    ('PRIORITY_BUFFER_HIGH', 0),
-    ('PRIORITY_BUFFER_MEDIUM', 2),
-    ('PRIORITY_BUFFER_LOW', 4)
-ON CONFLICT (config_key) DO NOTHING;
-
--- Lead-time table for reorder planning, defaulting to 15 days.
-CREATE TABLE IF NOT EXISTS lead_time (
+-- Lead-days table for reorder planning, defaulting to 15 days.
+CREATE TABLE IF NOT EXISTS lead_days (
     product_code TEXT NOT NULL,
     buyer        TEXT NOT NULL,
-    lead_days    INTEGER NOT NULL DEFAULT 15,
+    days         INTEGER NOT NULL DEFAULT 15,
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (product_code, buyer)
 );
@@ -95,13 +90,14 @@ summary AS (
     FROM recent_sales
     GROUP BY product_code, description, branch, admin, buyer
 ),
-reorder_values AS (
+view_settings AS (
     SELECT
-        MAX(CASE WHEN config_key = 'ORDER_PROCESS_TIME' THEN config_value END) AS order_process_time,
-        MAX(CASE WHEN config_key = 'PRIORITY_BUFFER_HIGH' THEN config_value END) AS priority_buffer_high,
-        MAX(CASE WHEN config_key = 'PRIORITY_BUFFER_MEDIUM' THEN config_value END) AS priority_buffer_medium,
-        MAX(CASE WHEN config_key = 'PRIORITY_BUFFER_LOW' THEN config_value END) AS priority_buffer_low
-    FROM reorder_config
+        MAX(CASE WHEN key = 'order_process_days' THEN value END) AS order_process_days,
+        MAX(CASE WHEN key = 'default_lead_days' THEN value END) AS default_lead_days,
+        MAX(CASE WHEN key = 'order_buffer_high_days' THEN value END) AS order_buffer_high_days,
+        MAX(CASE WHEN key = 'order_buffer_medium_days' THEN value END) AS order_buffer_medium_days,
+        MAX(CASE WHEN key = 'order_buffer_low_days' THEN value END) AS order_buffer_low_days
+    FROM app_settings
 ),
 base AS (
     SELECT
@@ -132,14 +128,13 @@ base AS (
                     s.period_end
                     + INTERVAL '1 day' * FLOOR(s.total_pending_po / NULLIF(s.avg_daily_sales, 0))
                     - INTERVAL '1 day' * (
-                        COALESCE(lt.lead_days, 15)
-                        - COALESCE(rv.order_process_time, 4)
+                        COALESCE(ld.days, vs.default_lead_days::integer) - vs.order_process_days::integer
                     )
                     + INTERVAL '1 day' * COALESCE(
                         CASE
-                            WHEN s.avg_daily_sales >= 1000 THEN rv.priority_buffer_high
-                            WHEN s.avg_daily_sales >= 500 THEN rv.priority_buffer_medium
-                            ELSE rv.priority_buffer_low
+                            WHEN s.avg_daily_sales >= 1000 THEN vs.order_buffer_high_days::integer
+                            WHEN s.avg_daily_sales >= 500 THEN vs.order_buffer_medium_days::integer
+                            ELSE vs.order_buffer_low_days::integer
                         END,
                         0
                     )
@@ -148,12 +143,12 @@ base AS (
         END AS "Reorder Date",
         s.admin AS "Admin",
         s.buyer AS "Buyer",
-        COALESCE(lt.lead_days, 15) AS "Lead Time Days"
+        COALESCE(ld.days, vs.default_lead_days::integer) AS "Lead Time Days"
     FROM summary s
-    LEFT JOIN lead_time lt
-        ON lt.product_code = s.product_code
-        AND lt.buyer = s.buyer
-    CROSS JOIN reorder_values rv
+    LEFT JOIN lead_days ld
+        ON ld.product_code = s.product_code
+        AND ld.buyer = s.buyer
+    CROSS JOIN view_settings vs
 )
 SELECT
     "Product Code",

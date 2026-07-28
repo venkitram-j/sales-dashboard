@@ -1,8 +1,15 @@
 """
-Ingest new or modified Excel files from config.SOURCE_FOLDER into Postgres.
+Ingest new or modified Excel files into Postgres.
 
 Run manually:
     python ingest.py
+
+Where to look and how to parse files (source folder, header row, start
+column, columns to read) is configured in the DATABASE, via the
+dashboard's Settings panel — not in .env. This script reads that config
+at the start of each run, so changes made in the dashboard take effect
+on the next run without redeploying. If no source folder has been
+configured yet, this exits early with a message telling you to set one.
 
 In production this is scheduled (cron / Task Scheduler) to run daily
 after new files land in the folder. It is idempotent and safe to re-run:
@@ -22,11 +29,17 @@ import pandas as pd
 import psycopg2.extras
 from openpyxl.utils import column_index_from_string
 
-import config
-from db import get_conn, init_schema
+from db import get_conn, get_settings, init_schema
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ingest")
+
+# Specify column names from Excel file
+COLUMNS_TO_READ = ["Product Code", "Description", "Branch", "Sales Qty", "Pending PO", "Admin", "Buyer"]
+
+# Specify the database columns here according to data type
+STRING_COLS = ["product_code", "description", "branch", "admin", "buyer"]
+NUMERIC_COLS = ["sales_qty", "pending_po"]
 
 MTIME_TOLERANCE_SECONDS = 1.0  # avoid re-processing due to float rounding
 
@@ -77,10 +90,10 @@ def parse_period_from_filename(file_name):
     return None, None
 
 
-def list_source_files():
+def list_source_files(source_folder):
     paths = sorted(
-        glob.glob(os.path.join(config.SOURCE_FOLDER, "*.xlsx"))
-        + glob.glob(os.path.join(config.SOURCE_FOLDER, "*.xls"))
+        glob.glob(os.path.join(source_folder, "*.xlsx"))
+        + glob.glob(os.path.join(source_folder, "*.xls"))
     )
     return {Path(p).name: (p, os.path.getmtime(p)) for p in paths}
 
@@ -91,15 +104,16 @@ def get_ingested_mtimes(conn):
         return dict(cur.fetchall())
 
 
-def read_excel_file(path):
+def read_excel_file(path, header_row, start_col):
     """Read one file per the configured header row / start column /
-    column subset. Raises on missing expected columns."""
-    df = pd.read_excel(path, header=config.HEADER_ROW - 1)
+    column subset (all sourced from the database settings). Raises on
+    missing expected columns."""
+    df = pd.read_excel(path, header=header_row - 1)
 
-    # Drop columns before START_COL by position (rather than using
+    # Drop columns before start_col by position (rather than using
     # usecols="B:XFD", which pandas rejects as out-of-bounds on sheets
     # narrower than column XFD — i.e. basically all real files).
-    start_idx = column_index_from_string(config.START_COL) - 1
+    start_idx = column_index_from_string(start_col) - 1
     if start_idx > 0:
         df = df.iloc[:, start_idx:]
 
@@ -110,32 +124,51 @@ def read_excel_file(path):
         if df[c].isna().all():
             df = df.drop(columns=c)
 
-    if config.COLUMNS_TO_READ:
-        missing = [c for c in config.COLUMNS_TO_READ if c not in df.columns]
+    if COLUMNS_TO_READ:
+        missing = [c for c in COLUMNS_TO_READ if c not in df.columns]
         if missing:
             raise ValueError(f"missing expected column(s): {', '.join(missing)}")
-        df = df[config.COLUMNS_TO_READ]
+        df = df[COLUMNS_TO_READ]
 
     return df
 
 
+def normalize_col(name):
+    """lowercase, spaces -> underscores — applied to the columns pulled
+    via COLUMNS_TO_READ"""
+    return str(name).strip().lower().replace(" ", "_")
+
+def denormalize_col(name):
+    """title case, underscores -> spaces — applied to the columns pulled
+    from the dataframe for appropriate display"""
+    return str(name).replace("_", " ").title()
+
+
 def build_fact_rows(df, file_name, period_start, period_end):
-    """Normalize a raw file's dataframe into the sales_fact row shape."""
+    """Normalize a raw file's dataframe into the sales_fact row shape.
+
+    The columns selected via COLUMNS_TO_READ are renamed here to
+    lowercase-with-underscores (e.g. "Sale Amount" -> "sale_amount")
+    before use, and the *_COL config values are normalized the same way
+    so the lookup still matches regardless of case/spacing differences
+    between the .env mapping and the actual Excel header text.
+    """
+    df = df.rename(columns={c: normalize_col(c) for c in df.columns})
+
+    out = pd.DataFrame()
+
+    for col in STRING_COLS:
+        out[col] = df[col].astype(str).str.strip()
+
+    for col in NUMERIC_COLS:
+        out[col] = pd.to_numeric(df[col], errors="coerce")
+    
     # Every row gets the file's overall period, regardless of whether it
     # also has a per-row sale_date — this is what lets date-range filters
     # work even for files with no per-row dates.
-    out = pd.DataFrame({
-        "product_code": df[config.PRODUCT_COL].astype(str).str.strip(),
-        "description": df[config.DESCRIPTION_COL].astype(str).str.strip(),
-        "branch": df[config.BRANCH_COL].astype(str).str.strip(),
-        "sales_qty": pd.to_numeric(df[config.SALES_COL], errors="coerce"),
-        "pending_po": pd.to_numeric(df[config.PENDING_PO_COL], errors="coerce"),
-        "admin": df[config.ADMIN_COL].astype(str).str.strip(),
-        "buyer": df[config.BUYER_COL].astype(str).str.strip(),
-        "period_start": period_start,
-        "period_end": period_end,
-        "source_file": file_name,
-    })
+    out["period_start"] = period_start
+    out["period_end"] = period_end
+    out["source_file"] = file_name
     return out.dropna()
 
 
@@ -175,22 +208,27 @@ def replace_file_rows(conn, file_name, file_mtime, period_start, period_end, row
             )
 
 
-def run():
-    problems = config.validate()
-    if problems:
-        for p in problems:
-            log.error("Config problem: %s", p)
-        sys.exit(1)
-
-    if not os.path.isdir(config.SOURCE_FOLDER):
-        log.error("SOURCE_FOLDER does not exist or isn't accessible: %s", config.SOURCE_FOLDER)
-        sys.exit(1)
-
+def run_ingestion():
     init_schema()
 
-    files = list_source_files()
+    settings = get_settings()
+    source_folder = settings["source_folder"]
+    header_row = settings["header_row"]
+    start_col = settings["start_col"]
+
+    if not source_folder:
+        log.error(
+            "No SOURCE_FOLDER configured. Set it in the dashboard's Settings panel and try again."
+        )
+        sys.exit(1)
+
+    if not os.path.isdir(source_folder):
+        log.error("Configured SOURCE_FOLDER does not exist or isn't accessible: %s", source_folder)
+        sys.exit(1)
+
+    files = list_source_files(source_folder)
     if not files:
-        log.info("No Excel files found in %s", config.SOURCE_FOLDER)
+        log.info("No Excel files found in %s", source_folder)
         return
 
     with get_conn() as conn:
@@ -212,7 +250,7 @@ def run():
         for name in to_process:
             path, mtime = files[name]
             period_start, period_end = parse_period_from_filename(name)
-            if period_start is None and not config.DATE_COL:
+            if period_start is None:
                 log.warning(
                     "  %s: no period pattern matched in the file name and no DATE_COL is "
                     "configured — this file's rows won't be filterable by date range. "
@@ -220,12 +258,12 @@ def run():
                     name,
                 )
             try:
-                df = read_excel_file(path)
+                df = read_excel_file(path, header_row, start_col)
                 rows = build_fact_rows(df, name, period_start, period_end)
                 replace_file_rows(conn, name, mtime, period_start, period_end, rows, status="ok")
                 conn.commit()
                 ok_count += 1
-                period_note = f"[{period_start} to {period_end}]" if period_start else ""
+                period_note = f" [{period_start} to {period_end}]" if period_start else ""
                 log.info("OK   %-40s %d row(s)%s", name, len(rows), period_note)
             except Exception as e:
                 conn.rollback()
@@ -242,7 +280,3 @@ def run():
                     log.exception("Could not even record failure status for %s", name)
 
     log.info("Ingestion complete: %d succeeded, %d failed.", ok_count, err_count)
-
-
-if __name__ == "__main__":
-    run()

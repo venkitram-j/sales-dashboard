@@ -1,23 +1,19 @@
 """
 Sales Dashboard — reads pre-ingested sales data from Postgres (populated by
-ingest.py) and lets the team filter, view KPIs/trends, and attach a
-status + remark per (product, branch).
+ingest.py) per (product, branch).
 
 Run with:
     streamlit run dashboard_app.py
 """
 
-from pathlib import Path
-
+import os
 import pandas as pd
 import streamlit as st
 
-import config
-from db import get_conn, init_schema
+from db import get_conn, init_schema, get_settings, save_settings
+from ingest import normalize_col, denormalize_col, run_ingestion
 
 st.set_page_config(page_title="Sales Dashboard", layout="wide")
-
-CONFIG_FILE = Path("reorder_config.json")
 
 # ---------------------------------------------------------------------------
 # DB setup (cached across reruns within a session; cheap to call anyway)
@@ -30,6 +26,111 @@ def ensure_schema():
 
 
 ensure_schema()
+run_ingestion()
+
+# ---------------------------------------------------------------------------
+# Settings form (source folder, header row, start column, columns to read)
+# — shared by the first-run gate below and the sidebar "Edit settings"
+# expander further down.
+# ---------------------------------------------------------------------------
+
+def render_settings_form(current, key_prefix):
+    with st.form(f"{key_prefix}_settings_form"):
+        source_folder = st.text_input(
+            "Source folder (path on the server running this app)",
+            value=current["source_folder"],
+            placeholder=r"e.g. /mnt/company_share/sales_files",
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            start_col = st.text_input("Start column", value=current["start_col"])
+        with c2:
+            header_row = st.number_input("Header row #", min_value=1, value=current["header_row"], step=1)
+
+        if key_prefix == "setup":
+            c3, c4 = st.columns(2)
+            with c3:
+                order_process_days = st.number_input(
+                    "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
+    
+            with c4:
+                default_lead_days = st.number_input(
+                    "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
+            
+            c5, c6 ,c7 = st.columns(3)
+            with c5:
+                order_buffer_high_days = st.number_input(
+                    "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
+
+            with c6:
+                order_buffer_medium_days = st.number_input(
+                    "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
+
+            with c7:
+                order_buffer_low_days = st.number_input(
+                    "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
+        else:
+            order_process_days = st.number_input(
+                "Order Process Days", min_value=0, value=current["order_process_days"], step=1)
+
+            default_lead_days = st.number_input(
+                "Default Lead Time for Products in Days", min_value=0, value=current["default_lead_days"], step=1)
+
+            order_buffer_high_days = st.number_input(
+                "Order Buffer for High Priority Products", min_value=0, value=current["order_buffer_high_days"], step=1)
+
+            order_buffer_medium_days = st.number_input(
+                "Order Buffer for Medium Priority Products", min_value=0, value=current["order_buffer_medium_days"], step=1)
+
+            order_buffer_low_days = st.number_input(
+                "Order Buffer for Low Priority Products", min_value=0, value=current["order_buffer_low_days"], step=1)
+
+        submitted = st.form_submit_button("Save settings")
+
+    if not submitted:
+        return False
+
+    folder = source_folder.strip()
+    if not folder:
+        st.error("Source folder is required.")
+        return False
+    if not os.path.isdir(folder):
+        st.error(f"'{folder}' doesn't exist or isn't accessible from this server.")
+        return False
+
+    data = {
+        "source_folder": source_folder.strip(),
+        "header_row": str(int(header_row)),
+        "start_col": start_col.strip().upper() or "A",
+        "order_process_days": str(int(order_process_days)),
+        "default_lead_days": str(int(default_lead_days)),
+        "order_buffer_high_days": str(int(order_buffer_high_days)),
+        "order_buffer_medium_days": str(int(order_buffer_medium_days)),
+        "order_buffer_low_days": str(int(order_buffer_low_days)),
+    }
+    save_settings(data)
+    get_cached_settings.clear()
+    st.success("Settings saved.")
+    return True
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_cached_settings():
+    return get_settings()
+
+
+settings = get_cached_settings()
+
+if not settings["source_folder"]:
+    st.title("⚙️ Set up the data source")
+    st.write(
+        "Before the dashboard can load, tell it where to find your Excel files "
+        "and how they're formatted. This is stored in the database, so it only "
+        "needs to be set once (from anywhere on the team)."
+    )
+    if render_settings_form(settings, key_prefix="setup"):
+        st.rerun()
+    st.stop()
 
 # ---------------------------------------------------------------------------
 # Load and display materialized view and lead-time data
@@ -37,16 +138,20 @@ ensure_schema()
 
 st.title("📊 Sales Dashboard")
 
-# Refresh button for materialized view
-col1, col2 = st.columns([1, 10])
-with col1:
-    if st.button("🔄 Refresh Data"):
+st.sidebar.header("📁 Dashboard Config")
+
+if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
+    with st.spinner("Refreshing Data — this scans the source folder for new/changed files…"):
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("REFRESH MATERIALIZED VIEW product_branch_sales")
             conn.commit()
         st.success("Data refreshed!")
         st.cache_data.clear()
+
+with st.sidebar.expander("⚙️ Edit source settings"):
+    if render_settings_form(settings, key_prefix="edit"):
+        st.rerun()
 
 
 @st.cache_data
@@ -58,29 +163,26 @@ def load_view_data():
 
 
 @st.cache_data
-def load_lead_time_data():
-    """Load data from the lead_time table."""
+def load_lead_days_data():
+    """Load data from the lead_days table."""
     with get_conn() as conn:
-        query = "SELECT product_code, buyer, lead_days, updated_at FROM lead_time ORDER BY product_code, buyer"
+        query = "SELECT product_code, buyer, days, updated_at FROM lead_days ORDER BY product_code, buyer"
         df = pd.read_sql(query, conn)
+
     df["updated_at"] = pd.to_datetime(df["updated_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-    return df.rename(columns={
-        "product_code": "Product Code",
-        "buyer": "Buyer",
-        "lead_days": "Lead Days",
-        "updated_at": "Updated At",
-    })
+
+    return df.rename(columns={c: denormalize_col(c) for c in df.columns})
 
 
-def update_lead_time_from_dataframe(df):
-    """Update the lead_time table using an uploaded DataFrame."""
-    required_cols = {"product_code", "buyer", "lead_days"}
-    if not required_cols.issubset({c.lower() for c in df.columns}):
-        raise ValueError("Uploaded file must contain product_code, buyer, and lead_days columns.")
+def update_lead_days_from_dataframe(df):
+    """Update the lead_days table using an uploaded DataFrame."""
+    LEAD_DAYS_TABLE_COLUMNS = ["Product Code", "Buyer", "Days"]
+    missing = [c for c in LEAD_DAYS_TABLE_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"missing expected column(s): {', '.join(missing)} in Lead Days excel")
 
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-    df = df[["product_code", "buyer", "lead_days"]].copy()
-    df["lead_days"] = pd.to_numeric(df["lead_days"], errors="coerce").fillna(config.LEAD_TIME).astype(int)
+    df = df.rename(columns={c: normalize_col(c) for c in df.columns})
+    df["days"] = pd.to_numeric(df["days"], errors="coerce").fillna(settings["default_lead_days"]).astype(int)
     df = df.drop_duplicates(subset=["product_code", "buyer"], keep="last")
 
     pairs = [(row.product_code, row.buyer) for row in df.itertuples(index=False)]
@@ -89,7 +191,7 @@ def update_lead_time_from_dataframe(df):
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT product_code, buyer, lead_days FROM lead_time WHERE (product_code, buyer) IN %s",
+                    "SELECT product_code, buyer, days FROM lead_time WHERE (product_code, buyer) IN %s",
                     (tuple(pairs),)
                 )
                 for product_code, buyer, lead_days in cur.fetchall():
@@ -104,26 +206,26 @@ def update_lead_time_from_dataframe(df):
         with conn.cursor() as cur:
             for _, row in df.iterrows():
                 key = (row["product_code"], row["buyer"])
-                lead_days = int(row["lead_days"])
+                days = int(row["days"])
                 existing_value = existing_map.get(key)
                 if existing_value is None:
                     inserted += 1
-                    changed_rows.append({"product_code": key[0], "buyer": key[1], "lead_days": lead_days, "change": "inserted"})
-                elif existing_value != lead_days:
+                    changed_rows.append({"product_code": key[0], "buyer": key[1], "days": days, "change": "inserted"})
+                elif existing_value != days:
                     updated += 1
-                    changed_rows.append({"product_code": key[0], "buyer": key[1], "lead_days": lead_days, "change": "updated"})
+                    changed_rows.append({"product_code": key[0], "buyer": key[1], "days": days, "change": "updated"})
                 else:
                     unchanged += 1
 
                 cur.execute(
-                    "INSERT INTO lead_time (product_code, buyer, lead_days, updated_at) VALUES (%s, %s, %s, now()) "
-                    "ON CONFLICT (product_code, buyer) DO UPDATE SET lead_days = EXCLUDED.lead_days, updated_at = EXCLUDED.updated_at",
-                    (key[0], key[1], lead_days)
+                    "INSERT INTO lead_time (product_code, buyer, days, updated_at) VALUES (%s, %s, %s, now()) "
+                    "ON CONFLICT (product_code, buyer) DO UPDATE SET days = EXCLUDED.days, updated_at = EXCLUDED.updated_at",
+                    (key[0], key[1], days)
                 )
         conn.commit()
 
     st.cache_data.clear()
-    changes_df = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(columns=["product_code", "buyer", "lead_days", "change"])
+    changes_df = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(columns=["product_code", "buyer", "days", "change"])
     changes_df = changes_df.rename(columns={
         "product_code": "Product Code",
         "buyer": "Buyer",
@@ -138,92 +240,10 @@ def update_lead_time_from_dataframe(df):
         "changes": changes_df,
     }
 
-
-@st.cache_data
-def load_reorder_config_data():
-    """Load data from the reorder_config table."""
-    with get_conn() as conn:
-        query = "SELECT config_key, config_value, updated_at FROM reorder_config ORDER BY config_key"
-        df = pd.read_sql(query, conn)
-    df["updated_at"] = pd.to_datetime(df["updated_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-    return df.rename(columns={
-        "config_key": "Config Key",
-        "config_value": "Config Value",
-        "updated_at": "Updated At",
-    })
-
-
-def update_reorder_config_from_dataframe(df):
-    """Update the reorder_config table using an uploaded DataFrame."""
-    required_cols = {"config_key", "config_value"}
-    if not required_cols.issubset({c.lower() for c in df.columns}):
-        raise ValueError("Uploaded file must contain config_key and config_value columns.")
-
-    df = df.rename(columns={c: c.lower() for c in df.columns})
-    df = df[["config_key", "config_value"]].copy()
-    df["config_value"] = pd.to_numeric(df["config_value"], errors="coerce").astype(pd.Int64Dtype())
-    df = df.drop_duplicates(subset=["config_key"], keep="last")
-
-    keys = [row.config_key for row in df.itertuples(index=False)]
-    existing_map = {}
-    if keys:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT config_key, config_value FROM reorder_config WHERE config_key IN %s",
-                    (tuple(keys),)
-                )
-                for config_key, config_value in cur.fetchall():
-                    existing_map[config_key] = int(config_value)
-
-    inserted = 0
-    updated = 0
-    unchanged = 0
-    changed_rows = []
-
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            for _, row in df.iterrows():
-                key = row["config_key"]
-                value = int(row["config_value"])
-                existing_value = existing_map.get(key)
-                if existing_value is None:
-                    inserted += 1
-                    changed_rows.append({"config_key": key, "config_value": value, "change": "inserted"})
-                elif existing_value != value:
-                    updated += 1
-                    changed_rows.append({"config_key": key, "config_value": value, "change": "updated"})
-                else:
-                    unchanged += 1
-
-                cur.execute(
-                    "INSERT INTO reorder_config (config_key, config_value, updated_at) VALUES (%s, %s, now()) "
-                    "ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value, updated_at = EXCLUDED.updated_at",
-                    (key, value)
-                )
-        conn.commit()
-
-    st.cache_data.clear()
-    changes_df = pd.DataFrame(changed_rows) if changed_rows else pd.DataFrame(columns=["config_key", "config_value", "change"])
-    changes_df = changes_df.rename(columns={
-        "config_key": "Config Key",
-        "config_value": "Config Value",
-        "change": "Change",
-    })
-    return {
-        "processed": len(df),
-        "inserted": inserted,
-        "updated": updated,
-        "unchanged": unchanged,
-        "changes": changes_df,
-    }
-
-
 df_view = load_view_data()
-lead_time_df = load_lead_time_data()
-reorder_config_df = load_reorder_config_data()
+lead_time_df = load_lead_days_data()
 
-tabs = st.tabs(["Sales Summary", "Supplier Product Lead Time", "Summary Config"])
+tabs = st.tabs(["Sales Summary", "Supplier Product Lead Time"])
 
 with tabs[0]:
     st.subheader("Product Sales Summary")
@@ -266,17 +286,17 @@ with tabs[0]:
         st.dataframe(filtered_df, width='stretch')
 
 with tabs[1]:
-    st.subheader("Lead Time Table")
+    st.subheader("Lead Days Table")
     st.write(
-        "Upload an Excel file containing `product_code`, `buyer`, and `lead_days`. "
-        "The latest row per product_code/buyer pair will be kept."
+        "Upload an Excel file containing `Product Code`, `Buyer`, and `Days`. "
+        "The latest row per Product Code/Buyer pair will be kept."
     )
     uploaded_file = st.file_uploader("Upload lead time Excel file", type=["xlsx", "xls"])
     if uploaded_file is not None:
         try:
             excel_df = pd.read_excel(uploaded_file)
-            result = update_lead_time_from_dataframe(excel_df)
-            st.success("Lead time table updated successfully.")
+            result = update_lead_days_from_dataframe(excel_df)
+            st.success("Lead days table updated successfully.")
             st.write(
                 f"Processed {result['processed']} rows: "
                 f"{result['inserted']} inserted, {result['updated']} updated, {result['unchanged']} unchanged."
@@ -284,7 +304,7 @@ with tabs[1]:
             if not result['changes'].empty:
                 st.subheader("Updated Rows")
                 st.dataframe(result['changes'], width='stretch')
-            lead_time_df = load_lead_time_data()
+            lead_time_df = load_lead_days_data()
         except Exception as exc:
             st.error(f"Failed to load uploaded file: {exc}")
 
@@ -317,27 +337,3 @@ with tabs[1]:
         st.caption(f"Showing {len(filtered_lead_time_df)} row(s)")
         st.dataframe(filtered_lead_time_df, width='stretch')
 
-with tabs[2]:
-    st.subheader("Reorder Config")
-    st.write(
-        "Upload an Excel file containing `config_key` and `config_value`. "
-        "The latest value per config_key will be applied."
-    )
-    config_file = st.file_uploader("Upload reorder config Excel file", type=["xlsx", "xls"], key="reorder_config")
-    if config_file is not None:
-        try:
-            config_df = pd.read_excel(config_file)
-            config_result = update_reorder_config_from_dataframe(config_df)
-            st.success("Reorder config updated successfully.")
-            st.write(
-                f"Processed {config_result['processed']} rows: "
-                f"{config_result['inserted']} inserted, {config_result['updated']} updated, {config_result['unchanged']} unchanged."
-            )
-            if not config_result['changes'].empty:
-                st.subheader("Updated Config Rows")
-                st.dataframe(config_result['changes'], width='stretch')
-            reorder_config_df = load_reorder_config_data()
-        except Exception as exc:
-            st.error(f"Failed to load uploaded file: {exc}")
-
-    st.dataframe(reorder_config_df, width='stretch')
