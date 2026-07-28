@@ -1,0 +1,8 @@
+.github
+.vscode
+
+.env.dev
+.venv
+__pycache__
+
+SalesReports
