@@ -75,25 +75,27 @@ class IngestionService:
 
     # -- bulk load -------------------------------------------------------
     def _bulk_copy(self, df: pd.DataFrame) -> int:
-        """Bulk-load df into sales_fact via PostgreSQL COPY. Returns row count."""
+        """Bulk-load df into sales_fact. Returns row count."""
         if df.empty:
             return 0
-        raw_conn = self.engine.raw_connection()
+
+        conn = self.session.connection()
+
+        raw_conn = conn.connection  # DBAPI connection (psycopg)
+        cursor = raw_conn.cursor()
+
         try:
-            cursor = raw_conn.cursor()
             columns_sql = ", ".join(SALES_FACT_COLUMNS)
             copy_sql = f"COPY sales_fact ({columns_sql}) FROM STDIN"
             records = df[SALES_FACT_COLUMNS].itertuples(index=False, name=None)
-            with cursor.copy(copy_sql) as copy:  # psycopg3 copy API
+            with cursor.copy(copy_sql) as copy:
                 for row in records:
                     copy.write_row(row)
-            raw_conn.commit()
             return len(df)
         except Exception:
-            raw_conn.rollback()
             raise
         finally:
-            raw_conn.close()
+            cursor.close()
 
     def _delete_rows_for_file(self, file_name: str) -> None:
         self.session.execute(delete(SalesFact).where(SalesFact.source_file == file_name))
@@ -115,11 +117,6 @@ class IngestionService:
         df["period_start"] = period.period_start
         df["period_end"] = period.period_end
 
-        if is_reingest:
-            self._delete_rows_for_file(file_path.name)
-
-        row_count = self._bulk_copy(df)
-
         stat = file_path.stat()
         record = self._existing_record(file_path.name)
         if record is None:
@@ -130,6 +127,34 @@ class IngestionService:
         record.file_size_bytes = stat.st_size
         record.period_start = period.period_start
         record.period_end = period.period_end
+        record.status = "processing"   # optional but useful
+        record.error_message = None
+
+        # Flush so FK parent exists in DB BEFORE COPY
+        self.session.flush()
+
+        # --- Handle re-ingestion cleanup ---
+        if is_reingest:
+            self._delete_rows_for_file(file_path.name)
+
+        # --- Perform bulk COPY ---
+        try:
+            row_count = self._bulk_copy(df)
+
+        except Exception as exc:
+            # --- FAILURE PATH: update status safely ---
+            record.status = "failed"
+            record.error_message = str(exc)
+            record.row_count = record.row_count or 0
+
+            # Keep period fields consistent
+            record.period_start = record.period_start or period.period_start
+            record.period_end = record.period_end or period.period_end
+
+            self.session.flush()
+            raise
+
+        # --- Finalize success metadata ---
         record.row_count = row_count
         record.status = "success"
         record.error_message = None

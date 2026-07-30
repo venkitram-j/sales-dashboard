@@ -49,12 +49,10 @@ class DashboardView(BaseView):
     icon = "📊"
 
     def body(self) -> None:
-        top = st.columns([1, 1, 6])
-        with top[0]:
-            if st.button("🔄 Refresh", help="Parse new/modified files and refresh the view"):
-                with st.spinner("Ingesting new/modified files..."):
-                    result = run_full_ingest()
-                _report_result(result)
+        if st.button("🔄 Refresh", help="Parse new/modified files and refresh the view"):
+            with st.spinner("Ingesting new/modified files..."):
+                result = run_full_ingest()
+            _report_result(result)
 
         with session_scope() as session:
             service = DashboardService(session)
@@ -76,8 +74,7 @@ class DashboardView(BaseView):
             product_options = service.get_distinct_product_codes()
             branch_options = service.get_distinct_branches()
 
-        with top[1]:
-            st.metric("Rows", f"{total_rows:,}")
+        st.metric("Rows", f"{total_rows:,}")
 
         st.caption(
             f"{summary.get('products', 0):,} distinct products across "
