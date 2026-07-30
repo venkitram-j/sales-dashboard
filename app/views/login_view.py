@@ -90,7 +90,7 @@ class LoginView(BaseView):
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")
                 remember_me = st.checkbox("Remember me on this device")
-                submitted = st.form_submit_button("Log In", type="primary", use_container_width=True)
+                submitted = st.form_submit_button("Log In", type="primary", width="stretch")
 
             if submitted:
                 self._attempt_login(username, password, remember_me)

@@ -38,7 +38,7 @@ class LeadTimeView(BaseView):
         edited = st.data_editor(
             df,
             key="lead_time_editor",
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             disabled=["id", "product_code", "buyer", "updated_at"],
             column_config={

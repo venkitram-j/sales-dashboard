@@ -24,7 +24,7 @@ def render_topbar() -> None:
             unsafe_allow_html=True,
         )
     with logout_col:
-        if st.button("Log out", use_container_width=True):
+        if st.button("Log out", width="stretch"):
             username = current_username()
             log_out()
             logger.info("User logged out: username=%s", username)
