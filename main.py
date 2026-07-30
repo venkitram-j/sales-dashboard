@@ -81,7 +81,7 @@ def _handle_pending_settings_change() -> None:
 def main() -> None:
     app_settings = get_settings()
     st.set_page_config(
-        page_title="Inventory & Supply Chain App",
+        page_title="Sales Dashboard",
         page_icon="📦",
         layout="wide",
     )

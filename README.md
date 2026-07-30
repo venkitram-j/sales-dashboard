@@ -1,4 +1,4 @@
-# Inventory & Supply Chain App
+# Sales Dashboard App
 
 A Streamlit application for ingesting branch sales/inventory data from Excel
 files into PostgreSQL, browsing it on a dashboard, and managing

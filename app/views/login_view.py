@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 SESSION_KEY_USERNAME = "auth_username"
 SESSION_KEY_USER_ID = "auth_user_id"
-SESSION_COOKIE_NAME = "inventory_app_session"
+SESSION_COOKIE_NAME = "sales_dashboard_session"
 
 
 def is_authenticated() -> bool:
@@ -85,7 +85,7 @@ class LoginView(BaseView):
     def body(self) -> None:
         _, center, _ = st.columns([1, 2, 1])
         with center:
-            st.caption("Sign in to continue to the Inventory & Supply Chain App.")
+            st.caption("Sign in to continue to the Sales Dashboard App.")
             with st.form("login_form", border=True):
                 username = st.text_input("Username")
                 password = st.text_input("Password", type="password")

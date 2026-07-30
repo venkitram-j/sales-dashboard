@@ -46,8 +46,8 @@ class Settings(BaseSettings):
     # Database
     db_host: str = "localhost"
     db_port: int = 5432
-    db_name: str = "inventory_dev"
-    db_user: str = "inventory_app"
+    db_name: str = "sales_dashboard_dev"
+    db_user: str = "sales_dashboard_app"
     db_password: str = "change_me"
     db_sslmode: str = "prefer"
     db_pool_size: int = 5
