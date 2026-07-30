@@ -59,11 +59,25 @@ class DashboardView(BaseView):
         with session_scope() as session:
             service = DashboardService(session)
             summary = service.summary_counts()
+
+        total_rows = summary.get("total_rows", 0)
+
+        # Exit if no data
+        if total_rows == 0:
+            st.error(
+                "No data available. Please ingest files using the Refresh button "
+                "or check your source folder configuration."
+            )
+            return
+
+        # --- Continue ONLY if data exists ---
+        with session_scope() as session:
+            service = DashboardService(session)
             product_options = service.get_distinct_product_codes()
             branch_options = service.get_distinct_branches()
 
         with top[1]:
-            st.metric("Rows", f"{summary.get('total_rows', 0):,}")
+            st.metric("Rows", f"{total_rows:,}")
 
         st.caption(
             f"{summary.get('products', 0):,} distinct products across "
