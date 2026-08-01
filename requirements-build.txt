@@ -1,0 +1,6 @@
+# Only needed to build a standalone executable (see the README's
+# "Standalone executable (PyInstaller)" section). Not required to develop
+# or run the app normally -- install on top of requirements.txt:
+#   pip install -r requirements.txt -r requirements-build.txt
+pyinstaller>=6.21.0
+pyinstaller-hooks-contrib>=2026.6

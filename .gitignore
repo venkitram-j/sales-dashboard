@@ -1,8 +1,10 @@
 .github
 .vscode
 
-.env.dev
+.streamlit
+.env*
 .venv
 __pycache__
 
 SalesReports
+logs
