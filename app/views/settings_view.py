@@ -21,9 +21,6 @@ from app.services.settings_service import SETTING_DEFINITIONS, SettingsService
 logger = logging.getLogger(__name__)
 
 _INT_KEYS = [k for k, d in SETTING_DEFINITIONS.items() if d.value_type == "int"]
-_PATH_STRING_KEYS = [
-    k for k, d in SETTING_DEFINITIONS.items() if d.value_type in ("path", "string")
-]
 
 
 class SettingsView:
@@ -75,18 +72,18 @@ class SettingsView:
             help=SETTING_DEFINITIONS["source_folder"].description,
             placeholder="/path/to/excel/files",
         )
+        values["start_col"] = st.text_input(
+            SETTING_DEFINITIONS["start_col"].label,
+            value=str(defaults["start_col"]),
+            help=SETTING_DEFINITIONS["start_col"].description,
+            max_chars=3,
+        )
         values["header_row"] = st.number_input(
             SETTING_DEFINITIONS["header_row"].label,
             min_value=1,
             value=int(defaults["header_row"]),
             step=1,
             help=SETTING_DEFINITIONS["header_row"].description,
-        )
-        values["start_col"] = st.text_input(
-            SETTING_DEFINITIONS["start_col"].label,
-            value=str(defaults["start_col"]),
-            help=SETTING_DEFINITIONS["start_col"].description,
-            max_chars=3,
         )
 
         cols = st.columns(2)

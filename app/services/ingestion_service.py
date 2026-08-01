@@ -5,6 +5,17 @@ modified since their last ingestion (tracked via ingested_files), and bulk
 loads them into sales_fact using PostgreSQL's COPY protocol -- the fastest
 way to load millions of rows (far faster than row-by-row INSERT or even
 executemany/to_sql).
+
+Ordering note: sales_fact.source_file has a foreign key to
+ingested_files.file_name. The bulk COPY runs on its own raw DB connection/
+transaction (see _bulk_copy), separate from the SQLAlchemy ORM session used
+for everything else here -- so the ingested_files row for a new file must
+be committed *before* COPY-ing that file's rows into sales_fact, or the
+COPY fails with a ForeignKeyViolation (the row it references doesn't exist
+yet from the COPY connection's point of view). ingest_file() below commits
+the ingested_files upsert first, then COPYs; if the COPY then fails for any
+reason, the ingested_files row is deleted again so a failed ingest never
+leaves an orphaned record with no matching sales_fact rows.
 """
 from __future__ import annotations
 
@@ -38,6 +49,16 @@ SALES_FACT_COLUMNS = [
     "period_start",
     "period_end",
 ]
+
+
+def _as_utc(value: dt.datetime) -> dt.datetime:
+    """Normalizes a datetime to timezone-aware UTC. Some DB drivers/configs
+    can round-trip a DateTime(timezone=True) column back as naive; treat a
+    naive value as already being UTC rather than letting the comparison in
+    ingest_all() raise TypeError."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
 
 
 @dataclass
@@ -75,31 +96,47 @@ class IngestionService:
 
     # -- bulk load -------------------------------------------------------
     def _bulk_copy(self, df: pd.DataFrame) -> int:
-        """Bulk-load df into sales_fact. Returns row count."""
+        """Bulk-load df into sales_fact via PostgreSQL COPY, on its own raw
+        connection/transaction (see module docstring for why ordering
+        around this call matters). Returns row count."""
         if df.empty:
             return 0
-
-        conn = self.session.connection()
-
-        raw_conn = conn.connection  # DBAPI connection (psycopg)
-        cursor = raw_conn.cursor()
-
+        raw_conn = self.engine.raw_connection()
         try:
+            cursor = raw_conn.cursor()
             columns_sql = ", ".join(SALES_FACT_COLUMNS)
             copy_sql = f"COPY sales_fact ({columns_sql}) FROM STDIN"
             records = df[SALES_FACT_COLUMNS].itertuples(index=False, name=None)
-            with cursor.copy(copy_sql) as copy:
+            with cursor.copy(copy_sql) as copy:  # psycopg3 copy API
                 for row in records:
                     copy.write_row(row)
+            raw_conn.commit()
             return len(df)
         except Exception:
+            raw_conn.rollback()
             raise
         finally:
-            cursor.close()
+            raw_conn.close()
 
     def _delete_rows_for_file(self, file_name: str) -> None:
         self.session.execute(delete(SalesFact).where(SalesFact.source_file == file_name))
+
+    def _upsert_ingested_file_record(self, file_path: Path, row_count: int) -> IngestedFile:
+        stat = file_path.stat()
+        record = self._existing_record(file_path.name)
+        if record is None:
+            record = IngestedFile(file_name=file_path.name)
+            self.session.add(record)
+        record.file_path = str(file_path)
+        record.file_mtime = dt.datetime.fromtimestamp(stat.st_mtime, tz=dt.timezone.utc)
+        record.file_size_bytes = stat.st_size
+        record.row_count = row_count
         self.session.flush()
+        return record
+
+    def _delete_ingested_file_record(self, file_name: str) -> None:
+        self.session.execute(delete(IngestedFile).where(IngestedFile.file_name == file_name))
+        self.session.commit()
 
     # -- single file -------------------------------------------------------
     def ingest_file(
@@ -109,56 +146,31 @@ class IngestionService:
         start_col: str,
         is_reingest: bool,
     ) -> int:
-        """Parse + load one file. Returns rows inserted. Raises on failure
-        (caller decides how to record the failure)."""
+        """Parse + load one file. Returns rows inserted. Raises on failure;
+        any ingested_files row created for this file is removed again
+        before the exception propagates, so a failed ingest never leaves an
+        orphaned record."""
         period = parse_period_from_filename(file_path.name)
         df = parse_sales_excel(file_path, header_row=header_row, start_col=start_col)
         df["source_file"] = file_path.name
         df["period_start"] = period.period_start
         df["period_end"] = period.period_end
 
-        stat = file_path.stat()
-        record = self._existing_record(file_path.name)
-        if record is None:
-            record = IngestedFile(file_name=file_path.name)
-            self.session.add(record)
-        record.file_path = str(file_path)
-        record.file_mtime = dt.datetime.fromtimestamp(stat.st_mtime, tz=dt.timezone.utc)
-        record.file_size_bytes = stat.st_size
-        record.period_start = period.period_start
-        record.period_end = period.period_end
-        record.status = "processing"   # optional but useful
-        record.error_message = None
-
-        # Flush so FK parent exists in DB BEFORE COPY
-        self.session.flush()
-
-        # --- Handle re-ingestion cleanup ---
         if is_reingest:
             self._delete_rows_for_file(file_path.name)
 
-        # --- Perform bulk COPY ---
+        # Commit the ingested_files row (and the delete-old-rows above, if
+        # any) now, before the bulk COPY -- see module docstring.
+        self._upsert_ingested_file_record(file_path, row_count=len(df))
+        self.session.commit()
+
         try:
             row_count = self._bulk_copy(df)
-
-        except Exception as exc:
-            # --- FAILURE PATH: update status safely ---
-            record.status = "failed"
-            record.error_message = str(exc)
-            record.row_count = record.row_count or 0
-
-            # Keep period fields consistent
-            record.period_start = record.period_start or period.period_start
-            record.period_end = record.period_end or period.period_end
-
-            self.session.flush()
+        except Exception:
+            logger.exception("Bulk load failed for %s; removing its ingested_files record", file_path.name)
+            self._delete_ingested_file_record(file_path.name)
             raise
 
-        # --- Finalize success metadata ---
-        record.row_count = row_count
-        record.status = "success"
-        record.error_message = None
-        self.session.flush()
         return row_count
 
     # -- orchestration -------------------------------------------------------
@@ -179,7 +191,7 @@ class IngestionService:
             existing = self._existing_record(file_path.name)
 
             is_new = existing is None
-            is_modified = existing is not None and existing.file_mtime < mtime
+            is_modified = existing is not None and _as_utc(existing.file_mtime) < mtime
             if not is_new and not is_modified:
                 result.skipped_unchanged.append(file_path.name)
                 continue
@@ -196,17 +208,9 @@ class IngestionService:
             except (SourceFileParseError, FileNamePeriodError) as exc:
                 logger.error("Failed to ingest %s: %s", file_path.name, exc)
                 result.failed_files[file_path.name] = str(exc)
-                record = self._existing_record(file_path.name) or IngestedFile(file_name=file_path.name)
-                record.file_path = str(file_path)
-                record.file_mtime = mtime
-                record.file_size_bytes = stat.st_size
-                record.status = "failed"
-                record.error_message = str(exc)
-                record.row_count = record.row_count or 0
-                record.period_start = record.period_start or dt.date.today()
-                record.period_end = record.period_end or dt.date.today()
-                self.session.add(record)
-                self.session.flush()
+            except Exception as exc:  # noqa: BLE001 - one bad file shouldn't abort the batch
+                logger.exception("Unexpected error ingesting %s", file_path.name)
+                result.failed_files[file_path.name] = str(exc)
 
         if refresh_view and result.has_changes:
             refresh_sales_fact_view(self.session)

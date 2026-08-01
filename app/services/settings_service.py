@@ -30,8 +30,21 @@ def _identity(value: str) -> str:
 
 def _non_empty_string(value: str) -> str:
     if not value or not value.strip():
-        raise ValueError("Value must not be empty")
+        raise ValueError("must not be empty")
     return value.strip()
+
+
+class SettingsValidationError(ValueError):
+    """Raised when one or more settings fail validation. `field_labels`
+    carries the human-readable label of every offending field, in the
+    order they were validated, so the UI can tell the user exactly which
+    field(s) need attention rather than a generic 'invalid input' message.
+    """
+
+    def __init__(self, field_labels: list[str]):
+        self.field_labels = field_labels
+        joined = ", ".join(field_labels)
+        super().__init__(f"Missing or invalid value for: {joined}")
 
 
 @dataclass(frozen=True)
@@ -164,13 +177,31 @@ class SettingsService:
         return definition.caster(row.value)
 
     def update(self, values: dict[str, Any]) -> None:
-        """Validate and persist a batch of settings changes."""
+        """Validates every field in `values` before writing anything. If
+        any fail, raises SettingsValidationError naming all of them (not
+        just the first) so the form can show a single, complete error
+        message instead of the user fixing one field at a time."""
+        invalid_labels: list[str] = []
+        prepared: dict[str, Any] = {}
+
         for key, raw_value in values.items():
             definition = SETTING_DEFINITIONS.get(key)
             if definition is None:
                 logger.warning("Ignoring unknown setting key=%s", key)
                 continue
-            value = definition.validator(raw_value) if definition.validator else raw_value
+            if definition.validator is None:
+                prepared[key] = raw_value
+                continue
+            try:
+                prepared[key] = definition.validator(raw_value)
+            except ValueError:
+                invalid_labels.append(definition.label)
+
+        if invalid_labels:
+            raise SettingsValidationError(invalid_labels)
+
+        for key, value in prepared.items():
+            definition = SETTING_DEFINITIONS[key]
             row = self.session.scalar(select(AppSetting).where(AppSetting.key == key))
             if row is None:
                 row = AppSetting(key=key, value_type=definition.value_type)

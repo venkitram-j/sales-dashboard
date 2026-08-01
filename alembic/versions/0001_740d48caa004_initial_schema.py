@@ -41,11 +41,7 @@ def upgrade() -> None:
         sa.Column("file_path", sa.String(length=2000), nullable=False),
         sa.Column("file_mtime", sa.DateTime(timezone=True), nullable=False),
         sa.Column("file_size_bytes", sa.BigInteger(), nullable=False, server_default="0"),
-        sa.Column("period_start", sa.Date(), nullable=False),
-        sa.Column("period_end", sa.Date(), nullable=False),
         sa.Column("row_count", sa.Integer(), nullable=False, server_default="0"),
-        sa.Column("status", sa.String(length=20), nullable=False, server_default="success"),
-        sa.Column("error_message", sa.String(length=2000), nullable=True),
         sa.Column(
             "ingested_at",
             sa.DateTime(timezone=True),
@@ -100,6 +96,51 @@ def upgrade() -> None:
         sa.UniqueConstraint("product_code", "buyer", name="uq_product_supplier"),
     )
 
+    op.execute(
+        """
+        CREATE MATERIALIZED VIEW mv_sales_fact AS
+        SELECT
+            id,
+            product_code,
+            description,
+            branch,
+            sales_qty,
+            pending_po,
+            period_start,
+            period_end,
+            admin,
+            buyer
+        FROM sales_fact
+        WITH NO DATA;
+        """
+    )
+    # A unique index on id is required for REFRESH MATERIALIZED VIEW CONCURRENTLY.
+    op.execute("CREATE UNIQUE INDEX ix_mv_sales_fact_id ON mv_sales_fact (id);")
+    op.execute("CREATE INDEX ix_mv_sales_fact_product_code ON mv_sales_fact (product_code);")
+    op.execute("CREATE INDEX ix_mv_sales_fact_branch ON mv_sales_fact (branch);")
+
+    op.execute(
+        """
+        CREATE MATERIALIZED VIEW mv_product_supplier_lead_time AS
+        SELECT
+            id,
+            product_code,
+            buyer,
+            lead_days,
+            updated_at
+        FROM product_supplier_lead_time
+        WITH NO DATA;
+        """
+    )
+    op.execute(
+        "CREATE UNIQUE INDEX ix_mv_lead_time_id ON mv_product_supplier_lead_time (id);"
+    )
+
+    # Both views start empty (WITH NO DATA); populate them so the app's
+    # first REFRESH ... CONCURRENTLY has a valid baseline to work from.
+    op.execute("REFRESH MATERIALIZED VIEW mv_sales_fact;")
+    op.execute("REFRESH MATERIALIZED VIEW mv_product_supplier_lead_time;")
+
 
 def downgrade() -> None:
     op.drop_table("product_supplier_lead_time")
@@ -112,3 +153,5 @@ def downgrade() -> None:
     op.drop_table("ingested_files")
     op.drop_index("ix_app_settings_key", table_name="app_settings")
     op.drop_table("app_settings")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_product_supplier_lead_time;")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_sales_fact;")

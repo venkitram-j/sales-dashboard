@@ -16,6 +16,7 @@ them to a file.
 from __future__ import annotations
 
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
@@ -23,7 +24,23 @@ from typing import Literal
 from pydantic import Field, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
+
+def _base_dir() -> Path:
+    """Where .env/.env.production are looked for.
+
+    When running from source, this is the project root. When running from
+    a PyInstaller-built executable (sys.frozen is set), it's the directory
+    containing the executable itself -- NOT PyInstaller's read-only,
+    temp-extracted bundle dir (sys._MEIPASS) -- so a .env file placed next
+    to the .exe/binary is picked up and can be edited/replaced without
+    rebuilding. See the "Standalone executable" section in the README.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent.parent
+
+
+BASE_DIR = _base_dir()
 
 
 def _env_file() -> str:
@@ -62,9 +79,6 @@ class Settings(BaseSettings):
     # Ingestion
     ingest_batch_size: int = 50_000
     ingest_file_extensions: str = ".xlsx,.xlsm"
-
-    # Authentication
-    remember_me_days: int = 30
 
     @computed_field  # type: ignore[misc]
     @property

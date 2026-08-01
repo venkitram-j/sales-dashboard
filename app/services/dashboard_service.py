@@ -56,10 +56,10 @@ class DashboardService:
         sql = text(
             f"""
             SELECT product_code, description, branch, sales_qty, pending_po,
-                   admin, buyer, source_file, period_start, period_end
+                   admin, buyer, period_start, period_end
             FROM mv_sales_fact
             {where_sql}
-            ORDER BY product_code, branch
+            ORDER BY sales_qty DESC
             LIMIT :limit
             """
         )

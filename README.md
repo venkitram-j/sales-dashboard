@@ -1,4 +1,4 @@
-# Sales Dashboard App
+# Inventory & Supply Chain App
 
 A Streamlit application for ingesting branch sales/inventory data from Excel
 files into PostgreSQL, browsing it on a dashboard, and managing
@@ -13,9 +13,10 @@ product-supplier lead times used for order/reorder planning.
 - [Getting started (development)](#getting-started-development)
 - [Configuration](#configuration)
 - [Database migrations](#database-migrations)
-- [Managing users](#managing-users)
+- [Standalone ingestion](#standalone-ingestion)
 - [Scripts](#scripts)
 - [Production deployment](#production-deployment)
+- [Standalone executable (PyInstaller)](#standalone-executable-pyinstaller)
 - [Testing](#testing)
 - [Project layout](#project-layout)
 
@@ -35,14 +36,6 @@ product-supplier lead times used for order/reorder planning.
   see [Database migrations](#database-migrations)).
   scale to millions of rows without saturating executemany()/INSERT
   round-trips.
-- **Authentication**: username/password login backed by a `users` table
-  (bcrypt-hashed passwords via `app/utils/security.py`). Session state
-  (`st.session_state`) tracks who's logged in for the lifetime of the
-  browser session. An optional "remember me" cookie
-  (`app/utils/cookies.py` + a `user_sessions` table of hashed, expiring
-  tokens) persists login across full browser restarts — see
-  [Authentication](#1-authentication) for details. Accounts are managed
-  with `scripts/manage_users.py` — there is no sign-up UI.
 - **Config**: `pydantic-settings`, loaded from `.env` (development) or
   `.env.production` (production), selected via the `APP_ENV` environment
   variable. Real environment variables always override `.env` file values,
@@ -55,10 +48,8 @@ product-supplier lead times used for order/reorder planning.
 
 | Table | Purpose |
 |---|---|
-| `users` | Login accounts (username + bcrypt password hash) for the Authentication component |
-| `user_sessions` | Hashed 'remember me' session tokens (see Authentication below), each tied to a user and an expiry |
 | `app_settings` | Key/value store for app configuration (see below) |
-| `ingested_files` | One row per source Excel file, tracking ingestion state, mtime, size, and parsed period |
+| `ingested_files` | One row per **successfully** ingested Excel file (mtime, size, row count). A failed ingest never leaves a row — see Dashboard below |
 | `sales_fact` | One row per product/branch record parsed from a source file |
 | `product_supplier_lead_time` | Lead time (days) per product_code/buyer mapping |
 | `mv_sales_fact` (materialized view) | Read-optimized copy of `sales_fact`, refreshed after ingestion |
@@ -78,54 +69,7 @@ Current settings: `source_folder`, `header_row`, `start_col`,
 
 ## Features
 
-### 1. Authentication
-- A single **Login** page (`app/views/login_view.py`) is the only thing an
-  unauthenticated visitor can see — username + password, submitted via a
-  `st.form`. There is no self-service sign-up.
-- Passwords are stored as bcrypt hashes (`app/utils/security.py`) in the
-  `users` table, never in plaintext. `authenticate()` returns the same
-  generic "Invalid username or password" outcome whether the username
-  doesn't exist, the account is inactive, or the password is wrong, so the
-  login form doesn't leak which case occurred.
-- On successful login, `st.session_state` records the username/user id for
-  the rest of that browser session:
-  - If it's the app's initial run (no `source_folder` configured yet), the
-    **Settings** initial-setup page is shown next.
-  - Otherwise, the app proceeds straight to the **Dashboard**.
-- A **"Remember me on this device"** checkbox on the login form persists
-  the login across browser restarts:
-  - On check, a random 256-bit token is generated
-    (`app/utils/security.py::generate_session_token`). Only its SHA-256
-    hash is stored server-side, in a `user_sessions` row with an
-    expiry (`REMEMBER_ME_DAYS`, default 30); the raw token is set as an
-    HTTP-only-unavailable-but-`SameSite=Lax` cookie in the browser
-    (`app/utils/cookies.py`).
-  - On every subsequent app load, `try_auto_login()` reads that cookie via
-    Streamlit's built-in `st.context.cookies`, validates it against
-    `user_sessions` (checking expiry and that the account is still
-    active), and — if valid — signs the session in automatically with no
-    form. An invalid/expired/revoked cookie is cleared and the user sees
-    the normal login form.
-  - Logging out revokes that session server-side and clears the cookie
-    (`app/views/login_view.py::log_out`), so the "remember me" cookie
-    can't be reused afterward.
-  - Changing a user's password or deactivating their account
-    (`scripts/manage_users.py`) revokes **all** of that user's remember-me
-    sessions immediately, so a stolen/old cookie stops working right away.
-  - Cookie reads use Streamlit's native `st.context.cookies` (no extra
-    dependency); cookie writes use a small inline `<script>` snippet via
-    `st.components.v1.html`, since Streamlit has no built-in API to set
-    cookies yet ([streamlit/streamlit#9421](https://github.com/streamlit/streamlit/issues/9421)).
-    This keeps the feature dependency-free rather than relying on a
-    third-party cookie component.
-- Every authenticated page shows a top bar (`app/views/topbar.py`) with
-  *"Logged in as `<username>`"* and a **Log out** button, right-aligned
-  above the page content. Logging out clears the session state and returns
-  to the Login page.
-- Accounts are provisioned and managed entirely through
-  `scripts/manage_users.py` — see [Managing users](#managing-users).
-
-### 2. Settings
+### 1. Settings
 - On first run (no `source_folder` configured yet), a full-page form is
   shown and **nothing else in the app loads** until it's submitted
   successfully.
@@ -136,8 +80,21 @@ Current settings: `source_folder`, `header_row`, `start_col`,
     is wiped, every *other* setting is reset to its default, and a full
     re-ingest of the new folder runs immediately.
   - Otherwise: only `mv_sales_fact` is refreshed (cheap).
+- Validation runs across **every** field in the submitted form before
+  anything is saved (`SettingsService.update`, which raises a single
+  `SettingsValidationError`). If one or more required fields are missing or
+  invalid, the error names all of them by their on-screen label — e.g.
+  *"Missing or invalid value for: Source Folder"* — rather than the form
+  silently rejecting one field at a time. This applies identically to the
+  initial full-page form and the sidebar form.
 
-### 3. Dashboard
+### 2. Dashboard
+- **Empty state**: if `mv_sales_fact` has no rows yet (nothing ingested,
+  or everything failed), the page shows *only* a **Refresh** button and a
+  message asking you to check that your Excel file names follow the
+  required naming convention and that **Source Folder** in Settings points
+  at the right directory — no filters or empty table are shown over
+  nonexistent data.
 - Before this page is usable the first time, all eligible Excel files in
   `source_folder` are parsed and bulk-loaded into `sales_fact`.
 - A **Refresh** button re-scans `source_folder` for new or modified files
@@ -149,11 +106,25 @@ Current settings: `source_folder`, `header_row`, `start_col`,
     `source_file` are deleted first, then the file is re-parsed and
     re-inserted.
   - Unchanged file → skipped entirely.
+  - A file that fails to parse or load (bad naming convention, missing
+    columns, DB error, etc.) is reported by name with its error, and —
+    critically — **never leaves a partial `ingested_files` row behind**: if
+    ingestion fails at any point after that row was created, it's deleted
+    again in the same operation (`IngestionService.ingest_file`), so
+    `ingested_files` always accurately reflects what's actually in
+    `sales_fact`. This also matters for a subtler reason: `sales_fact.source_file`
+    has a foreign key to `ingested_files.file_name`, and the bulk load runs
+    on its own database connection (a raw `COPY`, separate from the regular
+    session) — so the `ingested_files` row for a file must be committed
+    *before* that file's rows are `COPY`-ed in, or the `COPY` fails with a
+    `ForeignKeyViolation`. `ingest_file()` commits the `ingested_files`
+    upsert first and only then runs the bulk copy, cleaning up if the copy
+    fails.
 - Filters (`product_code`, `branch` multiselects) and a free-text search
   (matches `product_code`, `branch`, `description`, `admin`, `buyer`) all
   query `mv_sales_fact`, never `sales_fact` directly.
 
-### 4. Product-Supplier Lead Time
+### 3. Product-Supplier Lead Time
 - An editable grid (`st.data_editor`) at the top of the page lets you update
   `lead_days` for existing product/buyer mappings; **Save Changes** persists
   edits and refreshes `mv_product_supplier_lead_time`.
@@ -209,18 +180,14 @@ createdb inventory_dev
 source .venv/bin/activate
 python scripts/check_db_connection.py
 
-# Create your first login account (no default/seed account exists)
-python scripts/manage_users.py add jane.doe
-
 # Run the app
 ./scripts/run_dev.sh
 ```
 
-The app opens in your browser (default `http://localhost:8501`). Log in
-with the account you just created; since this is the first run, you'll see
-the initial setup form next — point `source_folder` at a directory
-containing correctly-named `.xlsx` files (see naming convention above) and
-submit.
+The app opens in your browser (default `http://localhost:8501`). Since
+this is the first run, you'll see the initial setup form — point
+`source_folder` at a directory containing correctly-named `.xlsx` files
+(see naming convention above) and submit.
 
 ## Configuration
 
@@ -237,7 +204,6 @@ contents.
 | `LOG_LEVEL`, `LOG_DIR`, `LOG_JSON` | Logging |
 | `INGEST_BATCH_SIZE` | Reserved for chunked ingestion tuning |
 | `INGEST_FILE_EXTENSIONS` | Comma-separated extensions scanned in `source_folder` (default `.xlsx,.xlsm`) |
-| `REMEMBER_ME_DAYS` | How many days a "remember me" login session stays valid (default 30) |
 
 ## Database migrations
 
@@ -265,44 +231,27 @@ during a refresh); the refresh service transparently falls back to a
 blocking refresh if the concurrent refresh isn't possible yet (e.g. an empty
 view on first run).
 
-## Managing users
+## Standalone ingestion
 
-There is no sign-up UI. Accounts are created and maintained with
-`scripts/manage_users.py`, which talks to the same database as the app
-(respecting `APP_ENV`/`.env` the same way the other scripts do).
+Data ingestion (the same parse-and-bulk-load pipeline the Dashboard's
+**Refresh** button runs) can be run independently of the Streamlit app —
+useful for keeping the data fresh on a schedule even when nobody has the
+app open:
 
 ```bash
-# Create a user (prompts for a password, hidden input, with confirmation)
-python scripts/manage_users.py add jane.doe
-
-# Non-interactive (e.g. scripted provisioning) -- avoid this on shared
-# shells since the password ends up in shell history
-python scripts/manage_users.py add jane.doe --password 'a-strong-password'
-
-# Change an existing user's password
-python scripts/manage_users.py set-password jane.doe
-
-# Disable / re-enable login access without deleting the account
-python scripts/manage_users.py deactivate jane.doe
-python scripts/manage_users.py activate jane.doe
-
-# List all users, their active status, and last login time
-python scripts/manage_users.py list
-
-# Delete expired "remember me" session rows (safe to run on a periodic
-# schedule, e.g. a daily cron job -- rows aren't a security risk once
-# expired, this is just housekeeping)
-python scripts/manage_users.py purge-sessions
+./scripts/run_ingestion.sh production
+# or directly:
+APP_ENV=production python scripts/run_ingestion.py
 ```
 
-Passwords must be at least 8 characters; they're hashed with bcrypt
-(`app/utils/security.py`) before being stored — the script never writes
-plaintext to the database. Changing a user's password or deactivating their
-account immediately revokes all of that user's "remember me" sessions, so
-an old device can't stay logged in past either action. Run
-`python scripts/manage_users.py add` (with no `--password`) to create the
-first account after a fresh `./scripts/setup_dev.sh` / `./scripts/migrate.sh`,
-since the app itself has no way to create the first user.
+It scans `source_folder`, ingests whatever's new or modified, refreshes
+`mv_sales_fact`, prints a summary, and exits non-zero if `source_folder`
+isn't configured yet or if any file failed. Example cron entry to run it
+every 15 minutes:
+
+```cron
+*/15 * * * * cd /path/to/inventory_app && ./scripts/run_ingestion.sh production >> /var/log/inventory-ingest.log 2>&1
+```
 
 ## Scripts
 
@@ -319,7 +268,7 @@ directory (they `cd` to the project root themselves).
 | `rollback_migration.sh [steps]` | Roll back the N most recent migrations (default 1) |
 | `reset_dev_db.sh` | **Dev only.** Drops and recreates the whole schema |
 | `check_db_connection.py` | Verifies the configured DB is reachable |
-| `manage_users.py` | Add users, change passwords, activate/deactivate accounts, list users, purge expired remember-me sessions |
+| `run_ingestion.sh` / `run_ingestion.py` | Run data ingestion standalone (no Streamlit app needed) — for cron/systemd timers |
 
 ## Production deployment
 
@@ -333,6 +282,117 @@ directory (they `cd` to the project root themselves).
 5. Point `source_folder` at a path reachable by the process (a mounted
    network share, an synced object-storage folder, etc.).
 
+## Standalone executable (PyInstaller)
+
+You can package the app as a single executable with
+[PyInstaller](https://pyinstaller.org/) — useful for handing the app to
+someone who shouldn't need to install Python, pip, or any dependencies
+themselves.
+
+**What this does and doesn't give you.** The executable bundles the Python
+interpreter, the app's code, and all of its dependencies (Streamlit,
+SQLAlchemy, pandas, etc.) into one file that, when run, starts the same
+Streamlit UI and opens it in the browser. It does **not** bundle
+PostgreSQL — the machine running the executable still needs network access
+to a PostgreSQL instance with the schema already migrated (`alembic upgrade
+head`, run normally from a source checkout before you ever build or ship
+the executable — the frozen executable is a UI process only, not a
+migration tool).
+
+### 1. Install the build dependencies
+
+```bash
+source .venv/bin/activate
+pip install -r requirements-build.txt
+```
+
+### 2. Build it
+
+The one-line way:
+
+```bash
+./scripts/build_executable.sh          # --onefile (single binary)
+./scripts/build_executable.sh --onedir # a folder instead (see notes below)
+```
+
+...or run PyInstaller directly, which is what that script wraps:
+
+```bash
+pyinstaller \
+  --name InventoryApp \
+  --onefile \
+  --noconfirm \
+  --clean \
+  --add-data "main.py:." \
+  --collect-all streamlit \
+  --collect-all altair \
+  --collect-all pyarrow \
+  --hidden-import streamlit.runtime.scriptrunner.magic_funcs \
+  desktop_launcher.py
+```
+
+**On Windows**, PowerShell/cmd use `;` instead of `:` as the `--add-data`
+separator: `--add-data "main.py;."`. Everything else is identical (run it
+from an activated venv with `requirements-build.txt` installed).
+
+Why `desktop_launcher.py` and not `main.py` directly: Streamlit's
+`streamlit run <path>` reads and executes that path as a script file at
+runtime, not as an `import`. PyInstaller's static analyzer only discovers
+dependencies by following `import` statements, so freezing `main.py`
+directly would silently leave out everything the app imports.
+`desktop_launcher.py` (at the project root) works around this: it eagerly
+imports the whole `app` package so PyInstaller's analyzer bundles every
+transitive dependency, resolves `main.py`'s on-disk path correctly whether
+running from source or from the frozen bundle, and then hands that path to
+Streamlit's own CLI — equivalent to running `streamlit run main.py`. The
+`--add-data "main.py:."` flag is what makes the raw `main.py` file
+available on disk inside the bundle for that to work; `--collect-all
+streamlit` (and `altair`/`pyarrow`, two of Streamlit's own dependencies)
+pulls in the non-Python static assets (frontend JS/CSS, etc.) that
+PyInstaller's import-following alone wouldn't find.
+
+### 3. Configure and run the build
+
+The build lands in `dist/InventoryApp` (a single file for `--onefile`, a
+folder for `--onedir`). Before running it:
+
+1. Copy `.env.example` to `.env` (or `.env.production`, matching
+   `APP_ENV`) **in that same `dist/InventoryApp` folder** — i.e. next to
+   the executable, not inside your source checkout. `app/config/settings.py`
+   resolves this path relative to the running executable itself
+   (`sys.executable`'s directory) specifically so it's editable after the
+   build without rebuilding.
+2. Run the executable (double-click on Windows/macOS, or `./InventoryApp`
+   on Linux). It starts Streamlit and opens your default browser to it,
+   the same as `streamlit run main.py` would.
+
+### Notes and caveats
+
+- **`--onefile` vs `--onedir`**: `--onefile` produces one binary that
+  self-extracts to a temp directory on every launch — slower to start (a
+  few seconds), but simplest to distribute. `--onedir` produces a folder
+  (executable + a `_internal`/support directory) that runs faster since
+  there's no extraction step, at the cost of shipping a folder instead of
+  a single file. Prefer `--onedir` while troubleshooting a build — it's
+  much easier to inspect for missing files.
+- **Binary size**: expect 200–400+ MB. Streamlit alone pulls in a fair
+  amount (its frontend assets, pyarrow, altair, etc.); this is normal for
+  PyInstaller + Streamlit and not something specific to this app.
+- **Antivirus false positives**: PyInstaller onefile binaries are
+  sometimes flagged by Windows Defender/AV software (self-extracting +
+  unsigned executables are a common heuristic trigger). Code-signing the
+  binary (out of scope here) resolves this for real distribution.
+- **Missing-module errors at runtime**: if the built app fails with a
+  `ModuleNotFoundError` for something not already imported in
+  `desktop_launcher.py`, add an `import` for it there (forcing PyInstaller
+  to bundle it) and rebuild, or add `--hidden-import <module>` to the
+  `pyinstaller` command.
+- **It's still a networked app, not an offline one**: since it needs to
+  reach PostgreSQL and `source_folder` still needs to be a path the
+  executable's machine can read, this packaging mainly saves the "install
+  Python and pip install everything" step for the machine running the UI —
+  it doesn't make the app work without a database.
+
 ## Testing
 
 ```bash
@@ -340,43 +400,55 @@ source .venv/bin/activate
 pytest
 ```
 
-Tests cover the pure-logic pieces that don't require a live database:
-filename period parsing, column-header normalization, and Excel parsing
-(`header_row`/`start_col` handling, required-column validation). Extend with
-integration tests against a real/test Postgres instance (e.g. via
-`testcontainers`) for the ingestion, settings, and lead-time services if
-CI has Docker available.
+Tests cover two layers:
+
+- **Pure logic, no database**: filename period parsing, column-header
+  normalization, Excel parsing (`header_row`/`start_col` handling,
+  required-column validation), and frozen-executable config path
+  resolution (`tests/test_frozen_config.py` — see
+  [Standalone executable](#standalone-executable-pyinstaller)).
+- **Service logic against an in-memory SQLite database** (`tests/test_settings_service.py`,
+  `tests/test_ingestion_service.py`): `SettingsService`'s aggregated,
+  field-labeled validation errors, and `IngestionService`'s transactional
+  behavior — specifically, that the `ingested_files` row for a file is
+  committed (and visible from a *separate* connection, standing in for
+  Postgres' raw `COPY` connection) before that file's rows are bulk-loaded,
+  and that a failed bulk load removes the `ingested_files` row again rather
+  than leaving it orphaned. These tests use SQLite as a lightweight stand-in
+  for exercising real transaction/commit ordering, not for testing
+  Postgres-specific SQL (`COPY`, `REFRESH MATERIALIZED VIEW ... CONCURRENTLY`,
+  `ANY()`), which the tests replace with a stub.
+
+Extend with integration tests against a real/test Postgres instance (e.g.
+via `testcontainers`) for full end-to-end coverage of the `COPY`-based bulk
+load and materialized-view refreshes if CI has Docker available.
 
 ## Project layout
 
 ```
 main.py                          # Entry point: streamlit run main.py
+desktop_launcher.py               # PyInstaller entry point (see Standalone executable)
 app/
-  config/                        # pydantic-settings, dev/prod segregated
+  config/                        # pydantic-settings, dev/prod segregated (+ frozen-exe path resolution)
   database.py                    # SQLAlchemy engine/session (cached resources)
-  models/                        # ORM models: User, UserSession, AppSetting, IngestedFile, SalesFact, ProductSupplierLeadTime
+  models/                        # ORM models: AppSetting, IngestedFile, SalesFact, ProductSupplierLeadTime
   services/
-    auth_service.py              # authenticate + remember-me sessions + user provisioning (used by manage_users.py)
-    settings_service.py          # SETTING_DEFINITIONS registry + typed get/set
+    settings_service.py          # SETTING_DEFINITIONS registry + typed get/set + aggregated SettingsValidationError
     file_parser_service.py       # Excel -> normalized DataFrame
-    ingestion_service.py         # scan/diff/COPY bulk-load orchestration
+    ingestion_service.py         # scan/diff/COPY bulk-load orchestration (commit-before-copy FK ordering, cleanup-on-failure)
     lead_time_service.py         # upload/replace + update for lead times
     dashboard_service.py         # filtered reads from mv_sales_fact
     materialized_view_service.py # REFRESH MATERIALIZED VIEW [CONCURRENTLY]
   views/
     base.py                      # BaseView ABC (title + error boundary)
-    login_view.py                # the Authentication component's only page + remember-me + auto-login
-    topbar.py                    # "Logged in as ..." + Log out, shown on every page
     settings_view.py             # initial full-page form + sidebar form
-    dashboard_view.py            # ingestion trigger, filters, data grid
+    dashboard_view.py            # ingestion trigger, empty-state, filters, data grid
     lead_time_view.py            # update grid + bulk upload
   utils/
-    security.py                  # bcrypt password hashing + session token generation/hashing
-    cookies.py                   # read (st.context.cookies) / write (inline <script>) browser cookies
     filename_parser.py           # period_start/period_end from file name
     column_normalization.py      # "Pending PO" -> "pending_po"
     logging_config.py
 alembic/                         # migrations (env.py wired to app config)
-scripts/                         # lifecycle/migration/dev/user-management helper scripts
-tests/                           # pytest suite (pure-logic coverage)
+scripts/                         # lifecycle/migration/dev/ingestion/build helper scripts
+tests/                           # pytest suite (pure-logic + SQLite-backed service coverage)
 ```
