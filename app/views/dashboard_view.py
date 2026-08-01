@@ -83,13 +83,13 @@ class DashboardView(BaseView):
         filter_cols = st.columns(3)
         with filter_cols[0]:
             selected_products = st.multiselect("Filter: Product Code", product_options)
-        with filter_cols[1]:
-            selected_branches = st.multiselect("Filter: Branch", branch_options)
         with filter_cols[2]:
-            search_text = st.text_input(
-                "Search",
-                placeholder="Product code, branch, description, admin, or buyer...",
-            )
+            selected_branches = st.multiselect("Filter: Branch", branch_options)
+        
+        search_text = st.text_input(
+            "Search",
+            placeholder="Product Code, Branch, Description, Admin, or Buyer...",
+        )
 
         filters = DashboardFilters(
             product_codes=selected_products or None,
@@ -103,11 +103,6 @@ class DashboardView(BaseView):
 
         if len(df) == filters.limit:
             st.caption(f"Showing first {filters.limit:,} rows — narrow your filters to see more precisely.")
-        
-        DATE_COLUMNS = ["period_start", "period_end"]
-        for col in DATE_COLUMNS:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d-%b-%Y")
 
         st.dataframe(df, width="stretch", hide_index=True)
 

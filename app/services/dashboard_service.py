@@ -62,9 +62,7 @@ class DashboardService:
                 sales_qty AS "Sales Quantity",
                 pending_po AS "Pending PO",
                 admin AS "Admin",
-                buyer AS "Buyer",
-                period_start AS "Period Start",
-                period_end AS "Period End"
+                buyer AS "Buyer"
             FROM mv_sales_fact
             {where_sql}
             ORDER BY sales_qty DESC
