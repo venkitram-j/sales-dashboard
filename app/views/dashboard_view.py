@@ -9,6 +9,7 @@ from app.database import get_engine, session_scope
 from app.services.dashboard_service import DashboardFilters, DashboardService
 from app.services.ingestion_service import IngestionResult, IngestionService
 from app.services.settings_service import SettingsService
+from app.utils.ui import blocking_button
 from app.views.base import BaseView
 
 logger = logging.getLogger(__name__)
@@ -57,10 +58,13 @@ class DashboardView(BaseView):
             self._render_empty_state()
             return
 
-        if st.button("🔄 Refresh", help="Parse new/modified files and refresh the view"):
+        if blocking_button(
+            "🔄 Refresh", "dashboard_refreshing", help="Parse new/modified files and refresh the view"
+        ):
             with st.spinner("Ingesting new/modified files..."):
                 result = run_full_ingest()
             _report_result(result)
+            st.session_state["dashboard_refreshing"] = False
             st.rerun()
 
         with session_scope() as session:
@@ -110,10 +114,16 @@ class DashboardView(BaseView):
     def _render_empty_state(self) -> None:
         """No rows in mv_sales_fact yet: show only a Refresh button and
         guidance, rather than an empty table with filters over nothing."""
-        if st.button("🔄 Refresh", help="Parse files in source_folder and load them", type="primary"):
-            with st.spinner("Ingesting files from source folder..."):
+        if blocking_button(
+            "🔄 Refresh",
+            "dashboard_refreshing",
+            help="Parse files in source_folder and load them",
+            type="primary",
+        ):
+            with st.spinner("Ingesting files from source_folder..."):
                 result = run_full_ingest()
             _report_result(result)
+            st.session_state["dashboard_refreshing"] = False
             st.rerun()
 
         st.info(

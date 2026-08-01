@@ -143,6 +143,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_product_supplier_lead_time;")
+    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_sales_fact;")
     op.drop_table("product_supplier_lead_time")
     op.drop_index("ix_sales_fact_product_branch", table_name="sales_fact")
     op.drop_index("ix_sales_fact_source_file", table_name="sales_fact")
@@ -153,5 +155,3 @@ def downgrade() -> None:
     op.drop_table("ingested_files")
     op.drop_index("ix_app_settings_key", table_name="app_settings")
     op.drop_table("app_settings")
-    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_product_supplier_lead_time;")
-    op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_sales_fact;")

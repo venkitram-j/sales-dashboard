@@ -37,6 +37,7 @@ import app.services.lead_time_service  # noqa: F401
 import app.services.materialized_view_service  # noqa: F401
 import app.services.settings_service  # noqa: F401
 import app.utils.logging_config  # noqa: F401
+import app.utils.ui  # noqa: F401
 import app.views.dashboard_view  # noqa: F401
 import app.views.lead_time_view  # noqa: F401
 import app.views.settings_view  # noqa: F401

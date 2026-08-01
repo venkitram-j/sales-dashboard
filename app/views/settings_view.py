@@ -33,12 +33,25 @@ class SettingsView:
             "files and how those files are laid out."
         )
 
+        # Two-run pattern: a real click sets this flag and reruns immediately
+        # so the button re-renders disabled; on that next run `processing`
+        # is True, so we perform the actual save (main.py then runs the
+        # initial ingest while the page still shows this disabled state).
+        processing = st.session_state.get("initial_setup_processing", False)
+
         with st.form("initial_settings_form", border=True):
             values = self._render_fields(defaults=None)
-            submitted = st.form_submit_button("Save & Continue", type="primary")
+            submitted = st.form_submit_button("Save & Continue", type="primary", disabled=processing)
 
-        if submitted:
-            return self._save(values, is_initial=True)
+        if submitted and not processing:
+            st.session_state["initial_setup_processing"] = True
+            st.rerun()
+
+        if processing:
+            saved = self._save(values, is_initial=True)
+            st.session_state["initial_setup_processing"] = False
+            return saved
+
         return False
 
     def render_sidebar(self) -> None:
@@ -48,11 +61,17 @@ class SettingsView:
 
         with st.sidebar:
             st.header("Settings")
+            # settings_just_saved is set True right below on a successful
+            # save and cleared by main.py's _handle_pending_settings_change()
+            # once it finishes the (possibly slow) refresh/reingest that
+            # follows -- reused here as the "busy" flag so the button stays
+            # disabled for that whole window, not just the save itself.
+            processing = st.session_state.get("settings_just_saved", False)
             with st.form("sidebar_settings_form", border=True):
                 values = self._render_fields(defaults=current)
-                submitted = st.form_submit_button("Save Settings", type="primary")
+                submitted = st.form_submit_button("Save Settings", type="primary", disabled=processing)
 
-            if submitted:
+            if submitted and not processing:
                 previous_folder = current["source_folder"]
                 saved = self._save(values, is_initial=False)
                 if saved:
