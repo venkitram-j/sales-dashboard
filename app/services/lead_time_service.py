@@ -34,8 +34,7 @@ class LeadTimeService:
         missing = REQUIRED_COLUMNS - set(raw.columns)
         if missing:
             raise LeadTimeUploadError(
-                f"Uploaded file is missing required column(s): {sorted(missing)}. "
-                f"Expected columns: Product Code, Buyer, Lead Days."
+                f"Uploaded file is missing required column(s), expected columns: Product Code, Buyer, Lead Days."
             )
 
         df = raw[list(REQUIRED_COLUMNS)].copy()

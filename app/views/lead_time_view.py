@@ -88,8 +88,9 @@ class LeadTimeView(BaseView):
                         settings_service = SettingsService(session)
                         default_lead_days = settings_service.get("default_lead_days")
                         service = LeadTimeService(session)
-                        df = service.parse_upload(tmp_path, default_lead_days=default_lead_days)
-                        count = service.replace_all(df)
+                        with st.spinner("Parsing and replacing lead time data..."):
+                            df = service.parse_upload(tmp_path, default_lead_days=default_lead_days)
+                            count = service.replace_all(df)
                     st.success(f"Replaced lead time data with {count:,} row(s).")
                     st.session_state["lead_time_uploading"] = False
                     st.rerun()

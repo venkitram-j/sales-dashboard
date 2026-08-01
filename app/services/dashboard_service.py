@@ -55,8 +55,16 @@ class DashboardService:
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         sql = text(
             f"""
-            SELECT product_code, description, branch, sales_qty, pending_po,
-                   admin, buyer, period_start, period_end
+            SELECT 
+                product_code AS "Product Code",
+                description AS "Description",
+                branch AS "Branch",
+                sales_qty AS "Sales Quantity",
+                pending_po AS "Pending PO",
+                admin AS "Admin",
+                buyer AS "Buyer",
+                period_start AS "Period Start",
+                period_end AS "Period End"
             FROM mv_sales_fact
             {where_sql}
             ORDER BY sales_qty DESC
