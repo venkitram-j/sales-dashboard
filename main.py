@@ -41,7 +41,7 @@ def _initial_setup_page() -> None:
     settings_view = SettingsView()
     just_configured = settings_view.render_initial_setup()
     if just_configured:
-        with st.spinner("Running initial ingestion of all files in source_folder..."):
+        with st.spinner("Running initial loading of all files in source folder..."):
             result = run_full_ingest()
         _report_result(result)
         st.session_state["settings_just_saved"] = False

@@ -24,6 +24,7 @@ class DashboardFilters:
     time_range: TimeRange = "ALL"
     product_codes: list[str] | None = None
     branches: list[str] | None = None
+    departments: list[str] | None = None
     search_text: str | None = None
     limit: int = 5000
 
@@ -67,6 +68,16 @@ class DashboardService:
         )
         return [r[0] for r in rows]
 
+    def get_distinct_departments(self, time_range: TimeRange = "ALL") -> list[str]:
+        rows = self.session.execute(
+            text(
+                "SELECT DISTINCT department FROM mv_sales_fact "
+                "WHERE time_range = :time_range ORDER BY department LIMIT 5000"
+            ),
+            {"time_range": time_range},
+        )
+        return [r[0] for r in rows]
+
     def query(self, filters: DashboardFilters) -> pd.DataFrame:
         clauses: list[str] = ["time_range = :time_range"]
         params: dict[str, object] = {"time_range": filters.time_range, "limit": filters.limit}
@@ -77,6 +88,9 @@ class DashboardService:
         if filters.branches:
             clauses.append("branch = ANY(:branches)")
             params["branches"] = filters.branches
+        if filters.departments:
+            clauses.append("department = ANY(:departments)")
+            params["departments"] = filters.departments
         if filters.search_text:
             clauses.append(
                 "(product_code ILIKE :search OR branch ILIKE :search OR description ILIKE :search "
@@ -91,6 +105,7 @@ class DashboardService:
                 SELECT DISTINCT ON (branch, product_code)
                     product_code,
                     branch,
+                    department,
                     description,
                     admin,
                     buyer,
@@ -107,7 +122,7 @@ class DashboardService:
                 {where_sql}
                 ORDER BY branch, product_code, period_end DESC, period_start DESC
             ) collapsed
-            ORDER BY product_code, branch
+            ORDER BY total_sales_qty DESC
             LIMIT :limit
             """
         )
@@ -119,9 +134,10 @@ class DashboardService:
             text(
                 "SELECT COUNT(DISTINCT (branch, product_code)) AS total_rows, "
                 "COUNT(DISTINCT product_code) AS products, "
-                "COUNT(DISTINCT branch) AS branches "
+                "COUNT(DISTINCT branch) AS branches, "
+                "COUNT(DISTINCT department) AS departments "
                 "FROM mv_sales_fact WHERE time_range = :time_range"
             ),
             {"time_range": time_range},
         ).mappings().first()
-        return dict(row) if row else {"total_rows": 0, "products": 0, "branches": 0}
+        return dict(row) if row else {"total_rows": 0, "products": 0, "branches": 0, "departments": 0}

@@ -87,24 +87,27 @@ class DashboardView(BaseView):
             summary = service.summary_counts(time_range=time_range)
             product_options = service.get_distinct_product_codes(time_range=time_range)
             branch_options = service.get_distinct_branches(time_range=time_range)
+            department_options = service.get_distinct_departments(time_range=time_range)
 
-        with top[2]:
-            st.metric("Branch/Products", f"{summary.get('total_rows', 0):,}")
+        st.metric("Branch/Products", f"{summary.get('total_rows', 0):,}")
 
         st.caption(
             f"{summary.get('products', 0):,} distinct products across "
-            f"{summary.get('branches', 0):,} branches — {time_range_label.lower()}"
+            f"{summary.get('branches', 0):,} branches "
+            f"under {summary.get('departments', 0)} departments — {time_range_label.lower()}"
         )
 
         if summary.get("total_rows", 0) == 0:
             st.info(f"No data falls within **{time_range_label}**. Try a wider time range.")
             return
 
-        filter_cols = st.columns(2)
+        filter_cols = st.columns(3)
         with filter_cols[0]:
             selected_products = st.multiselect("Filter: Product Code", product_options)
         with filter_cols[1]:
             selected_branches = st.multiselect("Filter: Branch", branch_options)
+        with filter_cols[2]:
+            selected_departments = st.multiselect("Filter: Department", department_options)
         
         search_text = st.text_input(
             "Search",
@@ -115,6 +118,7 @@ class DashboardView(BaseView):
             time_range=time_range,
             product_codes=selected_products or None,
             branches=selected_branches or None,
+            departments=selected_departments or None,
             search_text=search_text or None,
         )
 
@@ -127,6 +131,12 @@ class DashboardView(BaseView):
             width="stretch",
             hide_index=True,
             column_config={
+                "product_code": st.column_config.TextColumn("Product Code"),
+                "branch": st.column_config.TextColumn("Branch"),
+                "department": st.column_config.TextColumn("Department"),
+                "description": st.column_config.TextColumn("Description"),
+                "admin": st.column_config.TextColumn("Admin"),
+                "buyer": st.column_config.TextColumn("Buyer"),
                 "reorder_status": st.column_config.TextColumn("Reorder Status"),
                 "priority": st.column_config.TextColumn("Priority"),
                 "total_sales_qty": st.column_config.NumberColumn("Total Sales Qty", format="%.2f"),
@@ -145,10 +155,7 @@ class DashboardView(BaseView):
         """No rows in mv_sales_fact yet: show only a Refresh button and
         guidance, rather than an empty table with filters over nothing."""
         if blocking_button(
-            "🔄 Refresh",
-            "dashboard_refreshing",
-            help="Parse files in source_folder and load them",
-            type="primary",
+            "🔄 Refresh", "dashboard_refreshing", help="Parse files in source_folder and load them"
         ):
             with st.spinner("Ingesting files from source_folder..."):
                 result = run_full_ingest()

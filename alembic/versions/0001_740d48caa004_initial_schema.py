@@ -1,4 +1,4 @@
-"""initial schema: app_settings, ingested_files, sales_fact, product_supplier_lead_time
+"""initial schema: create all tables, materialized views, and indexes
 
 Revision ID: 740d48caa004
 Revises:
@@ -32,6 +32,7 @@ _CREATE_VIEW_SQL = """
             sf.id,
             sf.product_code,
             sf.description,
+            sf.department,
             sf.branch,
             sf.sales_qty,
             sf.pending_po,
@@ -121,6 +122,7 @@ _CREATE_VIEW_SQL = """
         r.id,
         r.product_code,
         r.description,
+        r.department,
         r.branch,
         r.sales_qty,
         r.pending_po,
@@ -205,6 +207,7 @@ def upgrade() -> None:
         sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
         sa.Column("product_code", sa.String(length=100), nullable=False),
         sa.Column("description", sa.String(length=500), nullable=True),
+        sa.Column("department", sa.String(length=100), nullable=False),
         sa.Column("branch", sa.String(length=100), nullable=False),
         sa.Column("sales_qty", sa.Numeric(18, 4), nullable=True),
         sa.Column("pending_po", sa.Numeric(18, 4), nullable=True),
@@ -246,20 +249,6 @@ def upgrade() -> None:
 
     op.execute(_CREATE_VIEW_SQL)
 
-    op.execute(
-        """
-        CREATE MATERIALIZED VIEW mv_product_supplier_lead_time AS
-        SELECT
-            id,
-            product_code,
-            buyer,
-            lead_days,
-            updated_at
-        FROM product_supplier_lead_time
-        WITH NO DATA;
-        """
-    )
-    
     # (time_range, id) instead of plain (id): each sales_fact row now
     # appears up to once per bucket it falls into, so id alone is no
     # longer unique.
@@ -273,9 +262,30 @@ def upgrade() -> None:
         "CREATE INDEX ix_mv_sales_fact_bucket_branch_product "
         "ON mv_sales_fact (time_range, branch, product_code);"
     )
+
+    op.execute("REFRESH MATERIALIZED VIEW mv_sales_fact;")
+
+    op.execute(
+        """
+        CREATE MATERIALIZED VIEW mv_product_supplier_lead_time AS
+        SELECT
+            id,
+            product_code,
+            buyer,
+            lead_days,
+            updated_at
+        FROM product_supplier_lead_time
+        WITH NO DATA;
+        """
+    )
     op.execute(
         "CREATE UNIQUE INDEX ix_mv_lead_time_id ON mv_product_supplier_lead_time (id);"
     )
+
+    # Both views start empty (WITH NO DATA); populate them so the app's
+    # first REFRESH ... CONCURRENTLY has a valid baseline to work from.
+    op.execute("REFRESH MATERIALIZED VIEW mv_sales_fact;")
+    op.execute("REFRESH MATERIALIZED VIEW mv_product_supplier_lead_time;")
 
 def downgrade() -> None:
     op.execute("DROP MATERIALIZED VIEW IF EXISTS mv_product_supplier_lead_time;")

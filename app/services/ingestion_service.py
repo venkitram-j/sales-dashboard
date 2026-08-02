@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 SALES_FACT_COLUMNS = [
     "product_code",
     "description",
+    "department",
     "branch",
     "sales_qty",
     "pending_po",
