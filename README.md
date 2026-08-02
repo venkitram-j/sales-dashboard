@@ -9,6 +9,7 @@ product-supplier lead times used for order/reorder planning.
 - [Architecture](#architecture)
 - [Data model](#data-model)
 - [Features](#features)
+- [mv_sales_fact: time-range buckets & reorder planning](#mv_sales_fact-time-range-buckets--reorder-planning)
 - [File naming convention (required)](#file-naming-convention-required)
 - [Getting started (development)](#getting-started-development)
 - [Configuration](#configuration)
@@ -52,7 +53,7 @@ product-supplier lead times used for order/reorder planning.
 | `ingested_files` | One row per **successfully** ingested Excel file (mtime, size, row count). A failed ingest never leaves a row — see Dashboard below |
 | `sales_fact` | One row per product/branch record parsed from a source file |
 | `product_supplier_lead_time` | Lead time (days) per product_code/buyer mapping |
-| `mv_sales_fact` (materialized view) | Read-optimized copy of `sales_fact`, refreshed after ingestion |
+| `mv_sales_fact` (materialized view) | Time-range-bucketed, branch/product-aggregated reorder-planning view built from `sales_fact` — see [mv_sales_fact: time-range buckets & reorder planning](#mv_sales_fact-time-range-buckets--reorder-planning) |
 | `mv_product_supplier_lead_time` (materialized view) | Read-optimized copy of `product_supplier_lead_time`, refreshed after uploads/updates |
 
 **Why `app_settings` is key/value, not one column per setting:** the spec
@@ -123,6 +124,15 @@ Current settings: `source_folder`, `header_row`, `start_col`,
 - Filters (`product_code`, `branch` multiselects) and a free-text search
   (matches `product_code`, `branch`, `description`, `admin`, `buyer`) all
   query `mv_sales_fact`, never `sales_fact` directly.
+- A **Time Range** selector (All / Last 7 Days / Last 30 Days / Last 90
+  Days) controls which pre-computed bucket of `mv_sales_fact` is queried —
+  see [mv_sales_fact: time-range buckets & reorder planning](#mv_sales_fact-time-range-buckets--reorder-planning)
+  below for how that's built.
+- The grid shows one row per **branch + product_code** (not one row per
+  ingested file) with reorder-planning columns: total sales quantity,
+  total pending PO, the actual period the aggregate covers, average daily
+  sales, a priority tier, a projected stock-out date, a reorder date, and
+  a reorder status — see the same section below.
 
 ### 3. Product-Supplier Lead Time
 - An editable grid (`st.data_editor`) at the top of the page lets you update
@@ -133,6 +143,123 @@ Current settings: `source_folder`, `header_row`, `start_col`,
   deleted and the uploaded rows are inserted — then the materialized view is
   refreshed. Missing/blank `Lead Days` values fall back to
   `app_settings.default_lead_days`.
+
+## mv_sales_fact: time-range buckets & reorder planning
+
+`mv_sales_fact` isn't a plain 1:1 copy of `sales_fact` anymore
+(`alembic/versions/0004_866544bf9f76_mv_sales_fact_reorder_columns.py`
+rebuilds it — Postgres has no `ALTER MATERIALIZED VIEW` for this kind of
+change, so the migration drops and recreates it). It now carries:
+
+- **A `time_range` bucket dimension**: `'ALL'`, `'LAST_7_DAYS'`,
+  `'LAST_30_DAYS'`, `'LAST_90_DAYS'`. Each `sales_fact` row appears once
+  per bucket it falls into (by `period_end >= CURRENT_DATE - N`), so the
+  Dashboard's Time Range selector is a plain `WHERE time_range = ...`
+  against pre-aggregated data — the filtering lives in the view itself,
+  not in a query-time aggregation. This trades view size (up to ~4x
+  `sales_fact`'s row count) for query-time simplicity and speed.
+- **Per (time_range, branch, product_code) window-function columns**,
+  identical across every row in the same group:
+  - `total_sales_qty`, `total_pending_po` — `SUM(...)` across every
+    `sales_fact` row in that group.
+  - `branch_product_period_start` / `branch_product_period_end` — the
+    actual `MIN(period_start)`/`MAX(period_end)` across the group; i.e.
+    the real date span the aggregate covers, which can be narrower than
+    the nominal window (e.g. "Last 30 Days" might only actually have 12
+    days of ingested data in it).
+  - `average_daily_sales` = `total_sales_qty / (branch_product_period_end
+    - branch_product_period_start + 1)`.
+  - `priority` = `HIGH` if `average_daily_sales >= 1000`, `MEDIUM` if
+    `>= 500`, else `LOW`.
+  - `stock_lasts_until` = `branch_product_period_end +
+    CEIL(total_pending_po / average_daily_sales)` (`NULL` if there's no
+    sales velocity to project from).
+  - `reorder_date` = `branch_product_period_end + (order_process_days -
+    effective_lead_days + order_buffer_days_for_priority)`, where
+    `effective_lead_days` is the product's lead time from
+    `product_supplier_lead_time` (matched on product_code **and** the
+    group's buyer) falling back to `app_settings.default_lead_days` if
+    there's no match, and the buffer is whichever of
+    `order_buffer_high_days` / `_medium_days` / `_low_days` matches the
+    row's `priority`.
+  - `reorder_status`: `OVERDUE`/`REORDER`/`PLAN` if `reorder_date <=`
+    today, escalating down through `REORDER`/`PLAN`/`OK` by priority at
+    `today+2` and `today+4`, `OK` beyond that — see
+    `app.services.reorder_logic.classify_reorder_status` for the exact
+    ladder (kept as plain, unit-tested Python specifically so the SQL
+    `CASE` expression it mirrors has a readable, testable reference).
+
+The Dashboard's `DashboardService.query()` reads this with `SELECT
+DISTINCT ON (branch, product_code) ... ORDER BY ... period_end DESC`, so
+what you see is one summary row per branch/product for the selected time
+range (picking the most recently reported period as the representative
+row when several `sales_fact` rows landed in the same group), not one row
+per ingested file.
+
+**Because `reorder_date`/`priority`/etc. depend on `app_settings` and
+`product_supplier_lead_time`, not just `sales_fact`**, `mv_sales_fact`
+needs refreshing whenever either changes — not only after ingestion. This
+is already wired up: saving order/buffer/lead-time settings in the
+sidebar refreshes it (`main.py`'s `_handle_pending_settings_change`), and
+so does any change to lead times on the Product-Supplier Lead Time page
+(`LeadTimeService.replace_all`/`update_row`/`update_many`).
+
+### Assumptions worth knowing about
+
+The requirements for a few of these columns left room for interpretation;
+here's exactly what was assumed, so it's easy to spot and correct if it
+doesn't match what you actually meant:
+
+- **`total_pending_po` is a `SUM`** across whatever rows fall in the
+  bucket, not a latest/point-in-time value. Pending PO is normally a
+  snapshot quantity (how much is currently on order), so summing it
+  across multiple overlapping reporting periods can overstate it — but
+  "total pending PO" is literally what was asked for. If a snapshot
+  (latest by `period_end`) is what's actually wanted, that's a one-line
+  change in the migration (a `DISTINCT ON`/`FILTER` style pick instead of
+  `SUM`).
+- **"Stock lasts until" needs a *remaining stock* quantity**, and this
+  schema has no on-hand-inventory column — only `sales_qty` (outflow) and
+  `pending_po` (on order). `total_pending_po` is used as the "remaining
+  stock" proxy. If there's a real stock-on-hand source, that should
+  replace it in the migration's `stock_lasts_until` expression.
+- **`reorder_date` is anchored to `branch_product_period_end`** (the
+  branch/product's own "as of" date within the selected bucket), not to
+  `stock_lasts_until`. Anchoring to `stock_lasts_until` instead would give
+  every zero-sales-velocity row a `NULL` reorder date/status, which seemed
+  wrong — a never-sold item still needs a reorder decision. Flag it if a
+  stock-depletion-anchored date was actually intended.
+- The "difference between order process days and product lead time"
+  wording was read as `order_process_days - effective_lead_days` (in that
+  order), added to `branch_product_period_end` along with the priority's
+  buffer days. Since lead time is normally the larger of the two, this
+  nets out to *subtracting* roughly `(lead_time - order_process_days)`
+  days from the period end before adding the buffer — i.e., longer lead
+  times push the reorder date earlier, which is the intended direction,
+  but the exact sign/formula was inferred from a genuinely ambiguous
+  sentence. Double-check `reorder_date` values against a known case (see
+  the worked example below) if this matters for real ordering decisions.
+- `reorder_date`/`reorder_status`/`stock_lasts_until` are computed
+  relative to `CURRENT_DATE` **at refresh time**, so they go stale between
+  refreshes exactly like the rest of the view. Schedule
+  `scripts/run_ingestion.sh` (or open the Dashboard) at least daily if
+  these need to stay current without manual refreshes.
+
+### Worked example (verified against a real PostgreSQL instance)
+
+With `order_process_days=3`, `default_lead_days=5`,
+`order_buffer_high_days=4`, `order_buffer_medium_days=2`, a product with
+`lead_days=7`, 13,000 total units sold and 2,500 total pending PO over a
+20-day actual window ending `2026-07-31`:
+
+- `average_daily_sales` = 13000 / 20 = **650** → `priority` = **MEDIUM**
+  (≥ 500, < 1000)
+- `stock_lasts_until` = 2026-07-31 + CEIL(2500 / 650) = 2026-07-31 + 4 =
+  **2026-08-04**
+- `reorder_date` = 2026-07-31 + (3 − 7 + 2) = 2026-07-31 − 2 =
+  **2026-07-29**
+- With "today" = 2026-08-01, `reorder_date <= today` → priority MEDIUM →
+  `reorder_status` = **REORDER**
 
 ## File naming convention (required)
 
@@ -404,9 +531,14 @@ Tests cover two layers:
 
 - **Pure logic, no database**: filename period parsing, column-header
   normalization, Excel parsing (`header_row`/`start_col` handling,
-  required-column validation), and frozen-executable config path
-  resolution (`tests/test_frozen_config.py` — see
-  [Standalone executable](#standalone-executable-pyinstaller)).
+  required-column validation), frozen-executable config path resolution
+  (`tests/test_frozen_config.py` — see
+  [Standalone executable](#standalone-executable-pyinstaller)), the
+  `priority`/`reorder_status` classification ladder
+  (`tests/test_reorder_logic.py` — mirrors the `CASE` expressions baked
+  into `mv_sales_fact`'s SQL; if you change a threshold, change it in
+  both places), and the `blocking_button` disable-while-busy UI helper
+  (`tests/test_ui_helpers.py`, via a mocked `st.button`/`st.rerun`).
 - **Service logic against an in-memory SQLite database** (`tests/test_settings_service.py`,
   `tests/test_ingestion_service.py`): `SettingsService`'s aggregated,
   field-labeled validation errors, and `IngestionService`'s transactional
@@ -419,9 +551,18 @@ Tests cover two layers:
   Postgres-specific SQL (`COPY`, `REFRESH MATERIALIZED VIEW ... CONCURRENTLY`,
   `ANY()`), which the tests replace with a stub.
 
-Extend with integration tests against a real/test Postgres instance (e.g.
-via `testcontainers`) for full end-to-end coverage of the `COPY`-based bulk
-load and materialized-view refreshes if CI has Docker available.
+`mv_sales_fact`'s actual SQL (the `CREATE MATERIALIZED VIEW` in
+`alembic/versions/0004_..._mv_sales_fact_reorder_columns.py`, and
+`DashboardService.query()`'s `DISTINCT ON` collapse) is Postgres-specific
+and isn't covered by the automated suite above — it was manually verified
+end-to-end against a real local PostgreSQL 16 instance while building this
+feature (migrations applied cleanly; the computed `total_sales_qty`,
+`average_daily_sales`, `priority`, `stock_lasts_until`, `reorder_date`, and
+`reorder_status` values were hand-checked against known inputs and matched
+exactly — see the worked example in the
+[mv_sales_fact section](#mv_sales_fact-time-range-buckets--reorder-planning)).
+That verification isn't automated/repeatable in CI, though — add it as a
+`testcontainers`-based integration test if CI has Docker available.
 
 ## Project layout
 
@@ -436,15 +577,17 @@ app/
     settings_service.py          # SETTING_DEFINITIONS registry + typed get/set + aggregated SettingsValidationError
     file_parser_service.py       # Excel -> normalized DataFrame
     ingestion_service.py         # scan/diff/COPY bulk-load orchestration (commit-before-copy FK ordering, cleanup-on-failure)
-    lead_time_service.py         # upload/replace + update for lead times
-    dashboard_service.py         # filtered reads from mv_sales_fact
+    lead_time_service.py         # upload/replace + update for lead times (also refreshes mv_sales_fact)
+    dashboard_service.py         # time-range-filtered, branch/product-collapsed reads from mv_sales_fact
+    reorder_logic.py             # plain-Python reference copy of the priority/reorder_status thresholds baked into mv_sales_fact's SQL
     materialized_view_service.py # REFRESH MATERIALIZED VIEW [CONCURRENTLY]
   views/
     base.py                      # BaseView ABC (title + error boundary)
     settings_view.py             # initial full-page form + sidebar form
-    dashboard_view.py            # ingestion trigger, empty-state, filters, data grid
+    dashboard_view.py            # ingestion trigger, empty-state, time-range filter, reorder-planning grid
     lead_time_view.py            # update grid + bulk upload
   utils/
+    ui.py                        # blocking_button() -- disables a button while its action is in flight
     filename_parser.py           # period_start/period_end from file name
     column_normalization.py      # "Pending PO" -> "pending_po"
     logging_config.py
