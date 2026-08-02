@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 REQUIRED_TARGET_COLUMNS = {
     "product_code",
     "description",
+    "department",
     "branch",
     "sales_qty",
     "pending_po",
@@ -67,6 +68,7 @@ def parse_sales_excel(file_path: Path, header_row: int, start_col: str) -> pd.Da
 
     df["product_code"] = df["product_code"].astype(str).str.strip()
     df["branch"] = df["branch"].astype(str).str.strip()
+    df["department"] = df["department"].astype(str).str.strip()
     df["description"] = df["description"].astype(str).str.strip()
     df["admin"] = df["admin"].astype(str).str.strip()
     df["buyer"] = df["buyer"].astype(str).str.strip()

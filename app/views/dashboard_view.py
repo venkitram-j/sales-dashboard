@@ -6,7 +6,7 @@ import streamlit as st
 import pandas as pd
 
 from app.database import get_engine, session_scope
-from app.services.dashboard_service import DashboardFilters, DashboardService
+from app.services.dashboard_service import TIME_RANGE_OPTIONS, DashboardFilters, DashboardService
 from app.services.ingestion_service import IngestionResult, IngestionService
 from app.services.settings_service import SettingsService
 from app.utils.ui import blocking_button
@@ -52,48 +52,77 @@ class DashboardView(BaseView):
 
     def body(self) -> None:
         with session_scope() as session:
-            summary = DashboardService(session).summary_counts()
+            # "Any data at all" is checked against the broadest bucket
+            # ('ALL') regardless of whatever time range the user might
+            # pick below -- a narrower window legitimately can be empty
+            # even when data exists overall.
+            overall_summary = DashboardService(session).summary_counts(time_range="ALL")
 
-        if summary.get("total_rows", 0) == 0:
+        if overall_summary.get("total_rows", 0) == 0:
             self._render_empty_state()
             return
 
-        if blocking_button(
-            "🔄 Refresh", "dashboard_refreshing", help="Parse new/modified files and refresh the view"
-        ):
-            with st.spinner("Ingesting new/modified files..."):
-                result = run_full_ingest()
-            _report_result(result)
-            st.session_state["dashboard_refreshing"] = False
-            st.rerun()
+        top = st.columns([1, 1, 6])
+        with top[0]:
+            if blocking_button(
+                "🔄 Refresh", "dashboard_refreshing", help="Parse new/modified files and refresh the view"
+            ):
+                with st.spinner("Ingesting new/modified files..."):
+                    result = run_full_ingest()
+                _report_result(result)
+                st.session_state["dashboard_refreshing"] = False
+                st.rerun()
+
+        with top[1]:
+            time_range_label = st.selectbox(
+                "Time Range",
+                options=list(TIME_RANGE_OPTIONS.keys()),
+                help="Aggregates (sales, priority, reorder planning) are computed over this window.",
+                label_visibility="collapsed",
+            )
+        time_range = TIME_RANGE_OPTIONS[time_range_label]
 
         with session_scope() as session:
             service = DashboardService(session)
-            summary = service.summary_counts()
-            product_options = service.get_distinct_product_codes()
-            branch_options = service.get_distinct_branches()
+            summary = service.summary_counts(time_range=time_range)
+            product_options = service.get_distinct_product_codes(time_range=time_range)
+            branch_options = service.get_distinct_branches(time_range=time_range)
+            department_options = service.get_distinct_departments(time_range=time_range)
+            admin_options = service.get_distinct_admins(time_range=time_range)
 
-        st.metric("Rows", f"{summary.get('total_rows', 0):,}")
+        st.metric("Branch/Products", f"{summary.get('total_rows', 0):,}")
 
         st.caption(
             f"{summary.get('products', 0):,} distinct products across "
-            f"{summary.get('branches', 0):,} branches"
+            f"{summary.get('branches', 0):,} branches "
+            f"across {summary.get('departments', 0)} departments "
+            f"under {summary.get('admins', 0):,} admins — {time_range_label.lower()}"
         )
 
-        filter_cols = st.columns(3)
+        if summary.get("total_rows", 0) == 0:
+            st.info(f"No data falls within **{time_range_label}**. Try a wider time range.")
+            return
+
+        filter_cols = st.columns(4)
         with filter_cols[0]:
             selected_products = st.multiselect("Filter: Product Code", product_options)
-        with filter_cols[2]:
+        with filter_cols[1]:
             selected_branches = st.multiselect("Filter: Branch", branch_options)
+        with filter_cols[2]:
+            selected_departments = st.multiselect("Filter: Department", department_options)
+        with filter_cols[3]:
+            selected_admins = st.multiselect("Filter: Admin", admin_options)
         
         search_text = st.text_input(
-            "Search",
-            placeholder="Product Code, Branch, Description, Admin, or Buyer...",
+            "Search", placeholder="Product Code, Branch, Description, Admin, or Buyer...",
         )
 
         filters = DashboardFilters(
+            time_range=time_range,
             product_codes=selected_products or None,
             branches=selected_branches or None,
+            departments=selected_departments or None,
+            admins=selected_admins or None,
             search_text=search_text or None,
         )
 
@@ -101,21 +130,45 @@ class DashboardView(BaseView):
             service = DashboardService(session)
             df = service.query(filters)
 
-        if len(df) == filters.limit:
-            st.caption(f"Showing first {filters.limit:,} rows — narrow your filters to see more precisely.")
+        if df.empty:
+            st.info("No rows match your filters. Try widening your filters or search text.")
+            return
 
-        st.dataframe(df, width="stretch", hide_index=True)
+        if len(df) == filters.limit:
+            st.caption(f"Showing first {filters.limit:,} rows.")
+        else:
+            st.caption(f"Showing {len(df):,} rows.")
+        
+        st.dataframe(
+            df,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "product_code": st.column_config.TextColumn("Product Code"),
+                "branch": st.column_config.TextColumn("Branch"),
+                "department": st.column_config.TextColumn("Department"),
+                "description": st.column_config.TextColumn("Description"),
+                "admin": st.column_config.TextColumn("Admin"),
+                "buyer": st.column_config.TextColumn("Buyer"),
+                "reorder_status": st.column_config.TextColumn("Reorder Status"),
+                "priority": st.column_config.TextColumn("Priority"),
+                "total_sales_qty": st.column_config.NumberColumn("Total Sales Qty", format="%.2f"),
+                "total_pending_po": st.column_config.NumberColumn("Total Pending PO", format="%.2f"),
+                "average_daily_sales": st.column_config.NumberColumn("Avg Daily Sales", format="%.2f"),
+                "stock_lasts_until": st.column_config.DateColumn("Stock Lasts Until", format="DD-MMM-YYYY"),
+                "reorder_date": st.column_config.DateColumn("Reorder Date", format="DD-MMM-YYYY"),
+                "period_start": st.column_config.DateColumn("Period Start", format="DD-MMM-YYYY"),
+                "period_end": st.column_config.DateColumn("Period End", format="DD-MMM-YYYY"),
+            },
+        )
 
     def _render_empty_state(self) -> None:
         """No rows in mv_sales_fact yet: show only a Refresh button and
         guidance, rather than an empty table with filters over nothing."""
         if blocking_button(
-            "🔄 Refresh",
-            "dashboard_refreshing",
-            help="Parse files in source_folder and load them",
-            type="primary",
+            "🔄 Refresh", "dashboard_refreshing", help="Parse files in source_folder and load them"
         ):
-            with st.spinner("Ingesting files from source_folder..."):
+            with st.spinner("Ingesting new/modified files..."):
                 result = run_full_ingest()
             _report_result(result)
             st.session_state["dashboard_refreshing"] = False

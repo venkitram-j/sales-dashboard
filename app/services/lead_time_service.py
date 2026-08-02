@@ -8,7 +8,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.orm import Session
 
 from app.models.product_supplier_lead_time import ProductSupplierLeadTime
-from app.services.materialized_view_service import refresh_lead_time_view
+from app.services.materialized_view_service import refresh_lead_time_view, refresh_sales_fact_view
 from app.utils.column_normalization import normalize_column_name
 
 logger = logging.getLogger(__name__)
@@ -61,6 +61,11 @@ class LeadTimeService:
 
         if refresh_view:
             refresh_lead_time_view(self.session)
+            # mv_sales_fact's reorder_date/reorder_status columns depend on
+            # product_supplier_lead_time (see the migration), so a lead
+            # time change needs to propagate there too, not just to
+            # mv_product_supplier_lead_time.
+            refresh_sales_fact_view(self.session)
 
         logger.info("Replaced product_supplier_lead_time with %d rows", len(records))
         return len(records)
@@ -90,6 +95,7 @@ class LeadTimeService:
         self.session.flush()
         if refresh_view:
             refresh_lead_time_view(self.session)
+            refresh_sales_fact_view(self.session)
 
     def update_many(self, updates: dict[int, int], refresh_view: bool = True) -> None:
         for row_id, lead_days in updates.items():
@@ -99,3 +105,4 @@ class LeadTimeService:
         self.session.flush()
         if refresh_view:
             refresh_lead_time_view(self.session)
+            refresh_sales_fact_view(self.session)
