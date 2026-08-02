@@ -229,7 +229,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_sales_fact_product_code", "sales_fact", ["product_code"])
     op.create_index("ix_sales_fact_branch", "sales_fact", ["branch"])
-    op.create_index("ix_sales_fact_source_file", "sales_fact", ["source_file"])
+    op.create_index("ix_sales_fact_description", "sales_fact", ["description"])
+    op.create_index("ix_sales_fact_department", "sales_fact", ["department"])
+    op.create_index("ix_sales_fact_admin", "sales_fact", ["admin"])
     op.create_index("ix_sales_fact_product_branch", "sales_fact", ["product_code", "branch"])
 
     op.create_table(

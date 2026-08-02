@@ -25,6 +25,7 @@ class DashboardFilters:
     product_codes: list[str] | None = None
     branches: list[str] | None = None
     departments: list[str] | None = None
+    admins: list[str] | None = None
     search_text: str | None = None
     limit: int = 5000
 
@@ -78,6 +79,16 @@ class DashboardService:
         )
         return [r[0] for r in rows]
 
+    def get_distinct_admins(self, time_range: TimeRange = "ALL") -> list[str]:
+        rows = self.session.execute(
+            text(
+                "SELECT DISTINCT admin FROM mv_sales_fact "
+                "WHERE time_range = :time_range ORDER BY admin LIMIT 5000"
+            ),
+            {"time_range": time_range},
+        )
+        return [r[0] for r in rows]
+
     def query(self, filters: DashboardFilters) -> pd.DataFrame:
         clauses: list[str] = ["time_range = :time_range"]
         params: dict[str, object] = {"time_range": filters.time_range, "limit": filters.limit}
@@ -91,10 +102,13 @@ class DashboardService:
         if filters.departments:
             clauses.append("department = ANY(:departments)")
             params["departments"] = filters.departments
+        if filters.admins:
+            clauses.append("admin = ANY(:admins)")
+            params["admins"] = filters.admins
         if filters.search_text:
             clauses.append(
                 "(product_code ILIKE :search OR branch ILIKE :search OR description ILIKE :search "
-                "OR admin ILIKE :search OR buyer ILIKE :search)"
+                "OR department ILIKE :search OR admin ILIKE :search OR buyer ILIKE :search)"
             )
             params["search"] = f"%{filters.search_text}%"
 
@@ -135,9 +149,10 @@ class DashboardService:
                 "SELECT COUNT(DISTINCT (branch, product_code)) AS total_rows, "
                 "COUNT(DISTINCT product_code) AS products, "
                 "COUNT(DISTINCT branch) AS branches, "
-                "COUNT(DISTINCT department) AS departments "
+                "COUNT(DISTINCT department) AS departments, "
+                "COUNT(DISTINCT admin) AS admins "
                 "FROM mv_sales_fact WHERE time_range = :time_range"
             ),
             {"time_range": time_range},
         ).mappings().first()
-        return dict(row) if row else {"total_rows": 0, "products": 0, "branches": 0, "departments": 0}
+        return dict(row) if row else {"total_rows": 0, "products": 0, "branches": 0, "departments": 0, "admins": 0}
